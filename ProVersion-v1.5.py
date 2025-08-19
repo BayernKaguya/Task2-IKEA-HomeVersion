@@ -1,5 +1,5 @@
 # shelf_optimizer_gui_final.py
-# 版本号：v1.5.2
+# 版本号：v1.5.3
 
 import customtkinter as ctk
 import tkinter.filedialog as filedialog
@@ -434,6 +434,7 @@ def get_detailed_unplaced_reasons_by_sku_id(unplaced_skus, final_shelves, h_max,
 def write_results_to_excel(original_file_path, placed_sku_ids, detailed_reasons, sku_id_col_name):
     """
     将安放状态和原因写回到原始Excel文件的一个新副本中。
+    v1.5.3: 为输出文件添加时间戳。
     """
     try:
         original_df = pd.read_excel(original_file_path)
@@ -450,7 +451,8 @@ def write_results_to_excel(original_file_path, placed_sku_ids, detailed_reasons,
         original_df['[未安放原因]'] = original_df[sku_id_col_name].apply(get_reason)
         
         base, ext = os.path.splitext(original_file_path)
-        output_path = f"{base}_results{ext}"
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        output_path = f"{base}_results_{timestamp}{ext}"
         original_df.to_excel(output_path, index=False)
         return True, output_path, None
     except Exception as e:
@@ -569,14 +571,12 @@ def calculation_worker(q, params, raw_data, shelves, agg_data=None):
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("货架配置优化工具 ProVersion-1.5.2 稳定版")
+        self.title("货架配置优化工具 ProVersion-1.5.3 稳定版")
         self.geometry("1150x800")
-        self.grid_columnconfigure(1, weight=1); self.grid_rowconfigure(0, weight=1)
+        self.grid_column_configure(1, weight=1); self.grid_rowconfigure(0, weight=1)
         
         # --- v1.5.2: 线程与缓存管理 ---
         self.queue = queue.Queue()
-        self.calc_thread = None
-        self.pre_calc_thread = None
         self.current_params = None
         self.cache = {} # 缓存字典
         
@@ -629,7 +629,6 @@ class App(ctk.CTk):
         self.display_welcome_message()
         self.toggle_h_params()
         
-        # --- v1.5.2: 启动持久化的消息队列轮询 ---
         self.after(100, self.process_queue)
 
     def toggle_h_params(self):
@@ -640,12 +639,13 @@ class App(ctk.CTk):
 
     def display_welcome_message(self):
         """显示欢迎信息。"""
-        self.update_textbox("""欢迎使用货架配置优化工具 ProVersion-1.5.2 稳定版！
+        self.update_textbox("""欢迎使用货架配置优化工具 ProVersion-1.5.3 稳定版！
 
 本工具旨在通过数据驱动的方式，为您推荐最优的两种货架规格，以最小化货架总数。
 
-v1.5.2 更新:
-- 修复了使用缓存进行第二次计算时程序卡死的Bug。
+v1.5.3 更新:
+- 为输出的Excel结果文件添加时间戳，避免覆盖。
+- 修复了第二次计算时界面卡死的Bug。
 - 优化了线程管理和UI响应逻辑。
 
 请在左侧配置好参数后，点击“开始计算”。
@@ -738,7 +738,6 @@ v1.5.2 更新:
         except queue.Empty:
             pass
         
-        # --- v1.5.2: 持续轮询队列 ---
         self.after(100, self.process_queue)
     
     def update_progress(self, current, total, start_time, stage_text):
@@ -768,8 +767,7 @@ v1.5.2 更新:
                 self.proceed_with_correlation_check()
             else:
                 self.status_label.configure(text="状态: 正在初始化...")
-                self.pre_calc_thread = threading.Thread(target=pre_calculation_worker, args=(self.queue, self.current_params))
-                self.pre_calc_thread.start()
+                threading.Thread(target=pre_calculation_worker, args=(self.queue, self.current_params)).start()
 
         except Exception as e:
             messagebox.showerror("输入或文件错误", f"发生错误: {e}")
@@ -815,8 +813,7 @@ v1.5.2 更新:
         if self.cache.get('h_max') == self.current_params['h_max']:
             agg_data_cache = self.cache.get('agg_data')
 
-        self.calc_thread = threading.Thread(target=calculation_worker, args=(self.queue, self.current_params, raw_data, shelves, agg_data_cache))
-        self.calc_thread.start()
+        threading.Thread(target=calculation_worker, args=(self.queue, self.current_params, raw_data, shelves, agg_data_cache)).start()
 
     def display_results(self, two_shelves, solution, coverage_target):
         """显示最终的优化方案结果。"""
