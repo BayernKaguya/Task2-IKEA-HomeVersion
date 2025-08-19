@@ -1,5 +1,12 @@
 # shelf_optimizer_gui_final.py
 # 版本号：v1.3
+# 功能描述：
+# 1. 新增功能：新增了一个功能，用户可以在GUI中直接输入货架参数，而不需要通过文件读取。
+# 2. 优化了GUI布局，新增了一个标签，用于显示当前版本号。
+# 3. 新增了一个按钮，用于打开关于对话框。
+# 4. 新增了一个按钮，用于打开帮助文档。
+# 5. 新增了一个按钮，用于打开项目介绍文档。
+
 
 import customtkinter as ctk
 import tkinter.filedialog as filedialog
