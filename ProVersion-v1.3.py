@@ -1,12 +1,5 @@
 # shelf_optimizer_gui_final.py
-# 版本号：v1.3
-# 功能描述：
-# 1. 新增功能：新增了一个功能，用户可以在GUI中直接输入货架参数，而不需要通过文件读取。
-# 2. 优化了GUI布局，新增了一个标签，用于显示当前版本号。
-# 3. 新增了一个按钮，用于打开关于对话框。
-# 4. 新增了一个按钮，用于打开帮助文档。
-# 5. 新增了一个按钮，用于打开项目介绍文档。
-
+# 版本号：v1.4.3
 
 import customtkinter as ctk
 import tkinter.filedialog as filedialog
@@ -34,6 +27,9 @@ NUM_BINS_FOR_AGGREGATION = 200
 # #############################################################################
 
 def read_excel_data(file_path, cols):
+    """
+    从指定的Excel文件路径读取并清洗SKU数据。
+    """
     df = pd.read_excel(file_path)
     data = pd.DataFrame()
     # 确保SKU编号列被当作字符串处理
@@ -50,17 +46,18 @@ def read_excel_data(file_path, cols):
     # 清洗掉任何字段为空的行
     data = data.dropna()
     
-    # --- 修正点 ---
     # 定义需要检查>0的数值列
     numeric_cols = ['L', 'D', 'H', 'W', 'V']
     # 只对这些数值列进行 > 0 的检查，然后用这个结果来筛选整个数据框
-    # 这样就避免了拿 'sku_id' 列和数字 0 进行比较
     data = data[(data[numeric_cols] > 0).all(axis=1)]
     
     data.reset_index(drop=True, inplace=True)
     return data
 
 def read_shelf_params(file_path):
+    """
+    从指定的TXT文件读取货架参数。
+    """
     shelves = []
     with open(file_path, 'r', encoding='utf-8') as f:
         for i, line in enumerate(f):
@@ -73,6 +70,9 @@ def read_shelf_params(file_path):
     return shelves
 
 def correlation_analysis(data):
+    """
+    分析SKU的长、深、面积与高度的相关性。
+    """
     data_for_corr = data[['L', 'D', 'H']].copy()
     data_for_corr['Area'] = data_for_corr['L'] * data_for_corr['D']
     corrs = {
@@ -91,14 +91,15 @@ def correlation_analysis(data):
     return max_corr_label, max_corr_value, grade
 
 def aggregate_skus(data, num_bins):
-    # 确保l_bin和d_bin只在有数据时创建
+    """
+    将相似尺寸的SKU聚合，以减少计算量。
+    """
     if not data.empty:
         data['l_bin'] = pd.cut(data['L'], bins=num_bins, labels=False, duplicates='drop')
         data['d_bin'] = pd.cut(data['D'], bins=num_bins, labels=False, duplicates='drop')
         agg_data = data.groupby(['l_bin', 'd_bin']).agg(
             L=('L', 'median'), D=('D', 'median'), H=('H', 'median'), 
             W=('W', 'median'), V=('V', 'median'), count=('L', 'size'),
-            # 收集组内所有的SKU ID
             sku_ids=('sku_id', lambda x: list(x))
         ).reset_index()
         return agg_data
@@ -106,6 +107,9 @@ def aggregate_skus(data, num_bins):
 
 
 def get_fittable_skus_for_shelf(agg_data, shelf, allow_rotation):
+    """
+    找出所有可以放入给定货架底面积的SKU组。
+    """
     fittable_skus = []
     for _, sku_group in agg_data.iterrows():
         l, d, w = sku_group['L'], sku_group['D'], sku_group['W']
@@ -115,10 +119,13 @@ def get_fittable_skus_for_shelf(agg_data, shelf, allow_rotation):
             
         fit_width = -1
         
+        # 检查不旋转的情况
         if l <= shelf['Lp'] and d <= shelf['Dp']:
             fit_width = l
         
+        # 检查旋转90度的情况
         if allow_rotation and d <= shelf['Lp'] and l <= shelf['Dp']:
+            # 如果两种方式都能放，选择较小的宽度以优化摆放
             fit_width = min(l, d) if fit_width != -1 else d
         
         if fit_width != -1:
@@ -127,11 +134,20 @@ def get_fittable_skus_for_shelf(agg_data, shelf, allow_rotation):
     return fittable_skus
 
 def ld_calculator_single(agg_data, shelves, coverage_target, allow_rotation, q):
+    """
+    计算最优的L&D规格。
+    如果无法达到目标，则返回能达到的最高覆盖率及其对应的货架规格。
+    """
     best_shelf, min_shelf_count = None, float('inf')
     total_sku_count = agg_data['count'].sum()
     total_sku_volume = (agg_data['V'] * agg_data['count']).sum()
     target_count = total_sku_count * coverage_target
     target_volume = total_sku_volume * coverage_target
+
+    # --- 用于追踪最佳尝试的变量 ---
+    best_attempt_shelf = None
+    max_achieved_count_coverage = 0.0
+    max_achieved_volume_coverage = 0.0
     
     total_shelves_to_eval = len(shelves)
     start_time = time.time()
@@ -142,10 +158,19 @@ def ld_calculator_single(agg_data, shelves, coverage_target, allow_rotation, q):
         placed_count = sum(item[2] for item in fittable_skus)
         placed_volume = sum(item[0]['V'] * item[2] for item in fittable_skus)
 
+        # --- 无论是否达标，始终记录当前覆盖率，并更新最佳尝试 ---
+        current_count_coverage = placed_count / total_sku_count if total_sku_count > 0 else 0
+        if current_count_coverage > max_achieved_count_coverage:
+            max_achieved_count_coverage = current_count_coverage
+            max_achieved_volume_coverage = placed_volume / total_sku_volume if total_sku_volume > 0 else 0
+            best_attempt_shelf = shelf
+
+        # 检查当前货架是否能满足覆盖率目标
         if total_sku_count == 0 or placed_count < target_count or placed_volume < target_volume:
             q.put(("progress", (i + 1, total_shelves_to_eval, start_time, f"评估L&D规格 {i+1}/{total_shelves_to_eval} (跳过)")))
             continue
 
+        # 如果满足目标，则计算所需货架数并更新最优解
         shelf_count = run_bulk_ffd_packing(fittable_skus, shelf['Lp'])
         if shelf_count < min_shelf_count:
             min_shelf_count = shelf_count
@@ -153,15 +178,32 @@ def ld_calculator_single(agg_data, shelves, coverage_target, allow_rotation, q):
         
         q.put(("progress", (i + 1, total_shelves_to_eval, start_time, f"评估L&D规格 {i+1}/{total_shelves_to_eval}")))
     
-    return best_shelf
+    # --- v1.4.3 修改: 根据是否找到最优解，返回不同结果 ---
+    if best_shelf:
+        # 成功：返回（状态，最优解，理论最优解，理论最高覆盖率）
+        return ("success", (best_shelf, best_attempt_shelf, max_achieved_count_coverage))
+    else:
+        # 失败：返回（状态，失败信息）
+        failure_info = {
+            "shelf": best_attempt_shelf,
+            "count_coverage": max_achieved_count_coverage,
+            "volume_coverage": max_achieved_volume_coverage
+        }
+        return ("failure", failure_info)
 
 def h_calculator_coverage_driven(data, h_max, p1, p2):
+    """
+    使用手动百分位法计算两种货架高度。
+    """
     h1 = np.percentile(data['H'], p1)
     h2 = np.percentile(data['H'], p2)
     h1, h2 = min(h1, h_max), min(h2, h_max)
     return sorted(list(set([round(h1), round(h2)])))
 
 def calculate_boundary_effects(data, h_max, step_size, volume_weight, q):
+    """
+    计算不同高度的边界效应值。
+    """
     heights = np.arange(data['H'].min(), h_max + step_size, step_size)
     results = []
     last_count, last_volume = 0, 0
@@ -184,6 +226,9 @@ def calculate_boundary_effects(data, h_max, step_size, volume_weight, q):
     return pd.DataFrame(results)
 
 def identify_candidate_heights(boundary_effects, min_diff, num_candidates=15):
+    """
+    从边界效应结果中筛选出候选高度点。
+    """
     top_effects = boundary_effects.nlargest(num_candidates * 3, 'effect')
     candidates = []
     for _, row in top_effects.iterrows():
@@ -193,7 +238,11 @@ def identify_candidate_heights(boundary_effects, min_diff, num_candidates=15):
         if len(candidates) >= num_candidates: break
     return sorted(candidates)
 
-def h_calculator_boundary_driven(agg_data, operable_data, best_ld_shelf, h_max, coverage_target, allow_rotation, params, q):
+def h_calculator_boundary_driven(agg_data, operable_data, best_ld_shelf, h_max, coverage_target, allow_rotation, params, q, best_theoretical_ld, best_theoretical_coverage):
+    """
+    使用边界效应算法，寻找最优的两种高度组合。
+    v1.4.3: 增加了 best_theoretical_ld 和 best_theoretical_coverage 参数用于失败时提供更丰富的诊断信息。
+    """
     q.put(("log", "--- 步骤 3a: 正在计算高度边界效应 ---\n"))
     effects_df = calculate_boundary_effects(operable_data, h_max, params['height_step'], params['volume_weight'], q)
     
@@ -207,22 +256,57 @@ def h_calculator_boundary_driven(agg_data, operable_data, best_ld_shelf, h_max, 
     q.put(("log", f"--- 步骤 3c: 正在评估 {len(height_combinations)} 种高度组合 ---\n"))
 
     best_combo, min_total_shelves = None, float('inf')
+    
+    # --- v1.4.2 新增: 追踪H计算步骤中的最佳尝试 ---
+    best_attempt_combo = None
+    max_coverage_in_h_step = 0.0
+    
     total_combos, start_time = len(height_combinations), time.time()
 
     for i, (h1, h2) in enumerate(height_combinations):
         final_shelves = [{'Lp': best_ld_shelf['Lp'], 'Dp': best_ld_shelf['Dp'], 'Wp': best_ld_shelf['Wp'], 'H': h1},
                          {'Lp': best_ld_shelf['Lp'], 'Dp': best_ld_shelf['Dp'], 'Wp': best_ld_shelf['Wp'], 'H': h2}]
         solution = final_allocation_and_counting(agg_data, final_shelves, coverage_target, allow_rotation)
-        if solution and sum(solution['counts']) < min_total_shelves:
+        
+        # --- v1.4.2 修改: 处理新的返回格式，并始终追踪最高覆盖率 ---
+        if solution['coverage_count'] > max_coverage_in_h_step:
+            max_coverage_in_h_step = solution['coverage_count']
+            best_attempt_combo = (h1, h2)
+
+        if solution['status'] == 'success' and sum(solution['counts']) < min_total_shelves:
             min_total_shelves = sum(solution['counts'])
             best_combo = (h1, h2)
+            
         q.put(("progress", (i + 1, total_combos, start_time, f"评估高度组合 {i+1}/{total_combos}")))
 
     if best_combo is None:
-        raise ValueError("在所有候选高度组合中，均未能找到满足覆盖率目标的方案。请尝试降低覆盖率目标。")
+        # --- v1.4.3 修改: 构建更详细的错误信息 ---
+        if best_attempt_combo is None:
+             raise ValueError("在评估高度组合时发生未知错误，未能找到任何有效的组合。")
+
+        h1_best, h2_best = sorted(list(best_attempt_combo))
+        error_msg = (
+            f"计算失败：未能找到满足覆盖率目标 ({coverage_target*100:.1f}%) 的高度组合。\n"
+            f"这通常发生在第一步选择的货架底面规格({best_ld_shelf['Lp']:.0f}x{best_ld_shelf['Dp']:.0f})虽然理论上可覆盖足够多的SKU，但在结合高度限制后，实际可安放的SKU数量下降。\n\n"
+            f"在当前底面规格下，能实现最高覆盖率的高度组合是:\n"
+            f"  - 高度组合: {h1_best:.0f}mm 和 {h2_best:.0f}mm\n"
+            f"  - 使用此组合的最大实际覆盖率: {max_coverage_in_h_step*100:.2f}%\n\n"
+            f"--- 诊断信息 ---\n"
+            f"在不考虑高度限制时，理论上覆盖率最高的L&D组合是:\n"
+            f"  - L&D组合: {best_theoretical_ld['Lp']:.0f} x {best_theoretical_ld['Dp']:.0f}\n"
+            f"  - 最高理论覆盖率: {best_theoretical_coverage*100:.2f}%\n\n"
+            f"【建议】\n1. 尝试将覆盖率目标降低至 {max_coverage_in_h_step*100:.1f}% 或以下。\n"
+            f"2. 检查货架参数文件，确保有更大尺寸的货架底面规格可选。"
+        )
+        raise ValueError(error_msg)
+        
     return sorted(list(best_combo))
 
 def final_allocation_and_counting(agg_data, two_final_shelves, coverage_target, allow_rotation):
+    """
+    将SKU分配到最终的两种货架规格中，并计算所需货架总数。
+    v1.4.2修改: 不再返回None，而是始终返回带状态的字典。
+    """
     assignments = {0: [], 1: []}
     for _, sku_group in agg_data.iterrows():
         possible_fits = []
@@ -248,18 +332,36 @@ def final_allocation_and_counting(agg_data, two_final_shelves, coverage_target, 
     placed_count = sum(item[2] for lst in assignments.values() for item in lst)
     placed_volume = sum(item[0]['V'] * item[2] for lst in assignments.values() for item in lst)
     
-    if total_sku_count == 0 or placed_count < total_sku_count * coverage_target or placed_volume < total_sku_volume * coverage_target:
-        return None 
+    coverage_count = placed_count / total_sku_count if total_sku_count > 0 else 0
+    coverage_volume = placed_volume / total_sku_volume if total_sku_volume > 0 else 0
 
+    # 检查目标是否达成
+    if total_sku_count == 0 or placed_count < total_sku_count * coverage_target or placed_volume < total_sku_volume * coverage_target:
+        # 失败，返回带诊断信息的字典
+        return {
+            'status': 'failure',
+            'counts': [0, 0], 
+            'coverage_count': coverage_count,
+            'coverage_volume': coverage_volume,
+            'placed_sku_ids': set()
+        }
+
+    # 成功，返回完整结果
     final_counts = [run_bulk_ffd_packing(assignments[i], two_final_shelves[i]['Lp']) for i in range(2)]
     placed_sku_ids = {sid for lst in assignments.values() for item in lst for sid in item[0]['sku_ids']}
     
-    return {'counts': final_counts, 
-            'coverage_count': placed_count / total_sku_count if total_sku_count > 0 else 0,
-            'coverage_volume': placed_volume / total_sku_volume if total_sku_volume > 0 else 0,
-            'placed_sku_ids': placed_sku_ids}
+    return {
+        'status': 'success',
+        'counts': final_counts, 
+        'coverage_count': coverage_count,
+        'coverage_volume': coverage_volume,
+        'placed_sku_ids': placed_sku_ids
+    }
 
 def calculate_fit_capacity(shelf_length, bin_state, item_width):
+    """
+    计算一个货架还能容纳多少个指定宽度的物品。
+    """
     if item_width <= 0: return 0
     count_on_shelf = bin_state['count']
     if count_on_shelf == 0:
@@ -274,6 +376,9 @@ def calculate_fit_capacity(shelf_length, bin_state, item_width):
         return math.floor((shelf_length - current_used_len) / item_cost)
 
 def run_bulk_ffd_packing(sku_groups, shelf_length):
+    """
+    使用首次适应递减(FFD)算法来模拟装箱，计算所需货架数。
+    """
     if not sku_groups: return 0
     sorted_groups = sorted(sku_groups, key=lambda x: x[1], reverse=True)
     bins = []
@@ -299,6 +404,9 @@ def run_bulk_ffd_packing(sku_groups, shelf_length):
     return len(bins)
 
 def get_detailed_unplaced_reasons_by_sku_id(unplaced_skus, final_shelves, h_max, allow_rotation):
+    """
+    为未能安放的SKU生成详细的原因说明。
+    """
     reasons = {}
     best_footprint = final_shelves[0]
     for _, sku in unplaced_skus.iterrows():
@@ -323,14 +431,18 @@ def get_detailed_unplaced_reasons_by_sku_id(unplaced_skus, final_shelves, h_max,
                  reason_parts.append(f"尺寸不匹配 ({sku['L']:.0f}x{sku['D']:.0f} vs {best_footprint['Lp']:.0f}x{best_footprint['Dp']:.0f})")
             reasons[sku_id] = " | ".join(reason_parts)
             continue
-        reasons[sku_id] = "因满足覆盖率目标未被选中"
+        
+        reasons[sku_id] = "托盘H不满足覆盖率要求"
+
     return reasons
 
 def write_results_to_excel(original_file_path, placed_sku_ids, detailed_reasons, sku_id_col_name):
+    """
+    将安放状态和原因写回到原始Excel文件的一个新副本中。
+    """
     try:
         original_df = pd.read_excel(original_file_path)
         
-        # 确保SKU ID列是字符串类型以便匹配
         original_df[sku_id_col_name] = original_df[sku_id_col_name].astype(str)
         
         def get_status(sku_id):
@@ -350,6 +462,9 @@ def write_results_to_excel(original_file_path, placed_sku_ids, detailed_reasons,
         return False, None, str(e)
 
 def calculation_worker(q, params, raw_data, shelves):
+    """
+    在后台线程中执行主要的计算任务。
+    """
     try:
         h_max = params['h_max']
         operable_data = raw_data[raw_data['H'] <= h_max].copy()
@@ -358,9 +473,36 @@ def calculation_worker(q, params, raw_data, shelves):
         agg_data = aggregate_skus(operable_data, NUM_BINS_FOR_AGGREGATION)
         q.put(("log", f"数据聚合完成，聚合后规格组数量: {len(agg_data)}\n"))
 
+        # --- v1.4.3 修改: 处理ld_calculator_single的返回 ---
         q.put(("log", "--- 步骤 2: 正在计算最优L&D规格 ---\n"))
-        best_ld = ld_calculator_single(agg_data, shelves, params['coverage_target'], params['allow_rotation'], q)
-        if best_ld is None: raise ValueError("L&D计算器未能找到有效的底面积规格。请检查货架参数或SKU数据。")
+        status, ld_return_value = ld_calculator_single(agg_data, shelves, params['coverage_target'], params['allow_rotation'], q)
+
+        if status == "failure":
+            # 如果L&D计算失败，说明目标过高，准备并发送详细的错误报告
+            ld_result = ld_return_value
+            best_attempt = ld_result["shelf"]
+            max_cc = ld_result["count_coverage"]
+            max_vc = ld_result["volume_coverage"]
+            
+            if best_attempt is None:
+                error_msg = "计算失败：无法找到任何有效的货架规格来安放哪怕一个SKU。请检查输入的SKU尺寸和货架尺寸是否匹配。"
+            else:
+                error_msg = (
+                    f"计算失败：覆盖率目标 ({params['coverage_target']*100:.1f}%) 过高，无法实现。\n\n"
+                    f"在所有候选货架中，能实现最高覆盖率的规格是:\n"
+                    f"  - 规格: {best_attempt['Lp']:.0f}(长) x {best_attempt['Dp']:.0f}(深)\n"
+                    f"  - 承重: {best_attempt['Wp']:.1f}kg\n\n"
+                    f"使用此规格，最大可达到的理论覆盖率为:\n"
+                    f"  - SKU数量覆盖率: {max_cc*100:.2f}%\n"
+                    f"  - SKU体积覆盖率: {max_vc*100:.2f}%\n\n"
+                    f"【建议】\n请将覆盖率目标降低至 {max_cc*100:.1f}% 或以下再尝试计算。"
+                )
+            
+            q.put(("error", error_msg))
+            return # 终止线程
+
+        # 如果成功，则解包结果并继续正常流程
+        best_ld, best_theoretical_ld, best_theoretical_coverage = ld_return_value
         q.put(("log", f"\n最优L&D规格确定: {best_ld['Lp']:.0f}x{best_ld['Dp']:.0f}\n\n"))
 
         q.put(("log", "--- 步骤 3: 正在计算最优H规格 ---\n"))
@@ -368,7 +510,8 @@ def calculation_worker(q, params, raw_data, shelves):
             h_cand = h_calculator_coverage_driven(operable_data, h_max, params['p1'], params['p2'])
             q.put(("log", f"使用手动百分位法，最优H规格确定: {h_cand[0]:.0f}mm 和 {h_cand[1]:.0f}mm\n\n"))
         else:
-            h_cand = h_calculator_boundary_driven(agg_data, operable_data, best_ld, h_max, params['coverage_target'], params['allow_rotation'], params, q)
+            # v1.4.3 修改: 传入理论最优L&D信息
+            h_cand = h_calculator_boundary_driven(agg_data, operable_data, best_ld, h_max, params['coverage_target'], params['allow_rotation'], params, q, best_theoretical_ld, best_theoretical_coverage)
             q.put(("log", f"\n使用边界效应算法，最优H规格确定: {h_cand[0]:.0f}mm 和 {h_cand[1]:.0f}mm\n\n"))
 
         h1, h2 = h_cand[0], h_cand[1]
@@ -379,7 +522,7 @@ def calculation_worker(q, params, raw_data, shelves):
         final_solution = final_allocation_and_counting(agg_data, final_shelves, params['coverage_target'], params['allow_rotation'])
         q.put(("log", "最终优化计算完成。\n"))
 
-        if final_solution is None:
+        if final_solution['status'] == 'failure':
             raise ValueError("最终优化步骤未能找到满足目标覆盖率的方案。")
         else:
             q.put(("result", (final_shelves, final_solution, params['coverage_target'])))
@@ -410,7 +553,7 @@ def calculation_worker(q, params, raw_data, shelves):
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("货架配置优化工具 ProVersion-1.0")
+        self.title("货架配置优化工具 ProVersion-1.4.3 稳定版")
         self.geometry("1150x800")
         self.grid_columnconfigure(1, weight=1); self.grid_rowconfigure(0, weight=1)
         self.queue = queue.Queue(); self.calc_thread = None
@@ -456,7 +599,6 @@ class App(ctk.CTk):
             entry = ctk.CTkEntry(self.frame_left); entry.grid(row=col_r, column=1, padx=20, sticky="ew"); entry.insert(0, defaults[key]); self.col_entries[key] = entry; col_r += 1
 
         self.output_textbox = ctk.CTkTextbox(self); self.output_textbox.grid(row=0, column=1, padx=(10,20), pady=20, sticky="nsew")
-        # 修正后的代码
         self.button_run = ctk.CTkButton(self, text="开始计算", height=40, font=ctk.CTkFont(size=18, weight="bold"), command=self.start_calculation)
         self.button_run.grid(row=1, column=1, padx=(10,20), pady=(0,10), sticky="ew")
         self.status_label = ctk.CTkLabel(self, text="状态: 空闲"); self.status_label.grid(row=2, column=1, padx=(10,20), pady=5, sticky="w")
@@ -465,12 +607,15 @@ class App(ctk.CTk):
         self.display_welcome_message(); self.toggle_h_params()
 
     def toggle_h_params(self):
+        """切换高度计算方法的参数输入框。"""
         self.frame_boundary_params.grid_forget(); self.frame_manual_params.grid_forget()
         if self.h_method_var.get() == "boundary": self.frame_boundary_params.grid(row=self.h_params_row, column=0, columnspan=2, padx=20, pady=5, sticky="ew")
         else: self.frame_manual_params.grid(row=self.h_params_row, column=0, columnspan=2, padx=20, pady=5, sticky="ew")
 
     def display_welcome_message(self):
-        self.update_textbox("""欢迎使用货架配置优化工具 ProVersion-1.0！
+        """显示欢迎信息。"""
+        self.update_textbox("""欢迎使用货架配置优化工具 ProVersion-1.4.3 稳定版！
+
 本工具旨在通过数据驱动的方式，为您推荐最优的两种货架规格，以最小化货架总数。
 
 新增“边界效应算法”参数说明:
@@ -487,6 +632,7 @@ class App(ctk.CTk):
     def paste_shelf_path(self): self.paste_path('shelf')
 
     def paste_path(self, file_type):
+        """从剪贴板粘贴文件路径。"""
         try:
             path = self.clipboard_get().strip().replace('"', '')
             if os.path.isfile(path): self.update_path(file_type, path)
@@ -494,18 +640,21 @@ class App(ctk.CTk):
         except: pass
 
     def update_path(self, file_type, path):
+        """更新文件路径标签。"""
         if not path: return
         label = self.sku_file_path_label if file_type == 'sku' else self.shelf_file_path_label
         setattr(self, f'selected_{file_type}_file', path)
         label.configure(text=os.path.basename(path), text_color="white")
 
     def update_textbox(self, text, clear=False):
+        """更新主文本框内容。"""
         self.output_textbox.configure(state="normal")
         if clear: self.output_textbox.delete("1.0", "end")
         self.output_textbox.insert("end", text); self.output_textbox.see("end")
         self.output_textbox.configure(state="disabled"); self.update_idletasks()
 
     def process_queue(self):
+        """处理后台线程发送的消息。"""
         try:
             msg_type, msg_content = self.queue.get_nowait()
             if msg_type == "log": self.update_textbox(msg_content)
@@ -513,13 +662,20 @@ class App(ctk.CTk):
             elif msg_type == "result": self.display_results(*msg_content)
             elif msg_type == "diagnostics": self.display_diagnostics(*msg_content)
             elif msg_type == "error":
-                self.update_textbox(f"\n!!!!!! 计算出错 !!!!!!\n错误信息: {msg_content}\n"); self.button_run.configure(state="normal")
+                self.update_textbox(f"\n!!!!!! 计算出错 !!!!!!\n\n{msg_content}\n")
+                self.button_run.configure(state="normal")
+                self.status_label.configure(text="状态: 计算失败")
+                self.progressbar.set(0)
             elif msg_type == "done":
-                self.status_label.configure(text=f"状态: {msg_content}"); self.button_run.configure(state="normal"); self.progressbar.set(1); return
+                self.status_label.configure(text=f"状态: {msg_content}")
+                self.button_run.configure(state="normal")
+                self.progressbar.set(1)
+                return
         except queue.Empty: pass
         self.after(100, self.process_queue)
     
     def update_progress(self, current, total, start_time, stage_text):
+        """更新进度条和状态标签。"""
         progress = current / total if total > 0 else 0; self.progressbar.set(progress)
         elapsed_time = time.time() - start_time; remaining_text = ""
         if current > 5 and progress > 0.01:
@@ -528,8 +684,11 @@ class App(ctk.CTk):
         self.status_label.configure(text=f"状态: {stage_text} | 已用: {elapsed_time:.0f}s{remaining_text}")
 
     def start_calculation(self):
+        """开始计算的主函数。"""
         try:
             if not hasattr(self, 'selected_sku_file') or not hasattr(self, 'selected_shelf_file'): raise ValueError("请先选择SKU和货架文件。")
+            
+            # 收集所有参数
             params = {'sku_file': self.selected_sku_file, 'shelf_file': self.selected_shelf_file}
             params.update({k: float(e.get()) for k, e in {'coverage_target': self.entry_coverage, 'h_max': self.entry_hmax}.items()})
             params['coverage_target'] /= 100.0
@@ -543,7 +702,7 @@ class App(ctk.CTk):
             else:
                 params.update({k: float(e.get()) for k, e in {'height_step': self.entry_height_step, 'min_height_diff': self.entry_min_height_diff, 'volume_weight': self.entry_volume_weight}.items()})
             
-            # --- Start Calculation ---
+            # --- 开始计算流程 ---
             self.update_textbox("", True); self.button_run.configure(state="disabled")
             self.status_label.configure(text="状态: 正在读取文件...")
             raw_data = read_excel_data(params['sku_file'], params['cols'])
@@ -552,25 +711,29 @@ class App(ctk.CTk):
             self.update_textbox("文件读取成功。\n--- 步骤 1: 正在进行L/D与H相关性检查 ---\n")
             corr_label, corr_val, grade = correlation_analysis(raw_data)
             self.update_textbox(f"最强相关性: '{corr_label}', r = {corr_val:.3f}, 评级: {grade}\n")
+            
             if messagebox.askyesno("相关性检查", f"检测到L/D与H的相关性为 {grade}。\n是否继续运行？"):
                 self.status_label.configure(text="状态: 正在初始化计算...")
                 self.calc_thread = threading.Thread(target=calculation_worker, args=(self.queue, params, raw_data, shelves))
-                self.calc_thread.start(); self.after(100, self.process_queue)
+                self.calc_thread.start()
+                self.after(100, self.process_queue)
             else:
                 self.update_textbox("用户选择取消操作。\n"); self.status_label.configure(text="状态: 已取消"); self.button_run.configure(state="normal")
         except Exception as e:
             messagebox.showerror("输入或文件错误", f"发生错误: {e}"); self.button_run.configure(state="normal"); self.status_label.configure(text="状态: 空闲")
 
     def display_results(self, two_shelves, solution, coverage_target):
+        """显示最终的优化方案结果。"""
         counts = solution['counts']; header = "\n" + "="*70 + "\n" + " " * 22 + ">>> 最终优化方案推荐 <<<\n" + "="*70 + "\n"
         self.update_textbox(header); self.update_textbox(f"优化目标: 在满足~{coverage_target*100:.0f}%覆盖率下，最小化货架总数\n" + "-" * 70 + "\n")
         self.update_textbox(f"最优方案所需货架总数: {sum(counts)} 个\n推荐的两种货架规格及其所需数量:\n")
         for i, shelf in enumerate(two_shelves):
-            self.update_textbox(f"  - 规格 {i+1}: {counts[i]} 个 | {shelf['Lp']:.0f}(长)×{shelf['Dp']:.0f}(深)×{shelf['H']:.0f}(高) | 承重: {shelf['Wp']:.0f}kg\n")
+            self.update_textbox(f"   - 规格 {i+1}: {counts[i]} 个 | {shelf['Lp']:.0f}(长)×{shelf['Dp']:.0f}(深)×{shelf['H']:.0f}(高) | 承重: {shelf['Wp']:.0f}kg\n")
         self.update_textbox("-" * 70 + "\n方案覆盖率指标:\n")
-        self.update_textbox(f"  - SKU数量覆盖率: {solution['coverage_count'] * 100:.2f}%\n  - SKU体积覆盖率: {solution['coverage_volume'] * 100:.2f}%\n")
+        self.update_textbox(f"   - SKU数量覆盖率: {solution['coverage_count'] * 100:.2f}%\n   - SKU体积覆盖率: {solution['coverage_volume'] * 100:.2f}%\n")
     
     def display_diagnostics(self, unplaced_skus, detailed_reasons):
+        """显示未安放SKU的诊断报告。"""
         header = "\n" + "="*70 + "\n" + " " * 22 + ">>> 未安放SKU诊断报告 <<<\n" + "="*70 + "\n"
         self.update_textbox(header)
         if unplaced_skus.empty: self.update_textbox("所有可操作的SKU均成功安放！\n"); return
@@ -579,7 +742,8 @@ class App(ctk.CTk):
             simple_reason = reason.split("(")[0].strip()
             reason_summary[simple_reason] = reason_summary.get(simple_reason, 0) + 1
         self.update_textbox(f"总共有 {len(unplaced_skus)} 个可操作SKU未能安放，原因汇总如下:\n")
-        for reason, count in reason_summary.items(): self.update_textbox(f"  - {reason}: {count} 个SKU\n")
+        for reason, count in sorted(reason_summary.items(), key=lambda item: item[1], reverse=True): 
+            self.update_textbox(f"   - {reason}: {count} 个SKU\n")
         self.update_textbox("-" * 70 + "\n详细原因已写入到输出的Excel文件中。\n" + "="*70 + "\n")
 
 if __name__ == "__main__":
