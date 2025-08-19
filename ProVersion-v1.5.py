@@ -1,5 +1,5 @@
 # shelf_optimizer_gui_final.py
-# 版本号：v1.4.4
+# 版本号：v1.5.2
 
 import customtkinter as ctk
 import tkinter.filedialog as filedialog
@@ -178,7 +178,6 @@ def ld_calculator_single(agg_data, shelves, coverage_target, allow_rotation, q):
         
         q.put(("progress", (i + 1, total_shelves_to_eval, start_time, f"评估L&D规格 {i+1}/{total_shelves_to_eval}")))
     
-    # --- v1.4.3 修改: 根据是否找到最优解，返回不同结果 ---
     if best_shelf:
         # 成功：返回（状态，最优解，理论最优解，理论最高覆盖率）
         return ("success", (best_shelf, best_attempt_shelf, max_achieved_count_coverage))
@@ -241,7 +240,6 @@ def identify_candidate_heights(boundary_effects, min_diff, num_candidates=15):
 def h_calculator_boundary_driven(agg_data, operable_data, best_ld_shelf, h_max, coverage_target, allow_rotation, params, q, best_theoretical_ld, best_theoretical_coverage):
     """
     使用边界效应算法，寻找最优的两种高度组合。
-    v1.4.3: 增加了 best_theoretical_ld 和 best_theoretical_coverage 参数用于失败时提供更丰富的诊断信息。
     """
     q.put(("log", "--- 步骤 3a: 正在计算高度边界效应 ---\n"))
     effects_df = calculate_boundary_effects(operable_data, h_max, params['height_step'], params['volume_weight'], q)
@@ -257,7 +255,6 @@ def h_calculator_boundary_driven(agg_data, operable_data, best_ld_shelf, h_max, 
 
     best_combo, min_total_shelves = None, float('inf')
     
-    # --- v1.4.2 新增: 追踪H计算步骤中的最佳尝试 ---
     best_attempt_combo = None
     max_coverage_in_h_step = 0.0
     
@@ -268,7 +265,6 @@ def h_calculator_boundary_driven(agg_data, operable_data, best_ld_shelf, h_max, 
                          {'Lp': best_ld_shelf['Lp'], 'Dp': best_ld_shelf['Dp'], 'Wp': best_ld_shelf['Wp'], 'H': h2}]
         solution = final_allocation_and_counting(agg_data, final_shelves, coverage_target, allow_rotation)
         
-        # --- v1.4.2 修改: 处理新的返回格式，并始终追踪最高覆盖率 ---
         if solution['coverage_count'] > max_coverage_in_h_step:
             max_coverage_in_h_step = solution['coverage_count']
             best_attempt_combo = (h1, h2)
@@ -280,7 +276,6 @@ def h_calculator_boundary_driven(agg_data, operable_data, best_ld_shelf, h_max, 
         q.put(("progress", (i + 1, total_combos, start_time, f"评估高度组合 {i+1}/{total_combos}")))
 
     if best_combo is None:
-        # --- v1.4.4 修改: 构建更详细的错误信息 ---
         if best_attempt_combo is None:
              raise ValueError("在评估高度组合时发生未知错误，未能找到任何有效的组合。")
 
@@ -306,7 +301,6 @@ def h_calculator_boundary_driven(agg_data, operable_data, best_ld_shelf, h_max, 
 def final_allocation_and_counting(agg_data, two_final_shelves, coverage_target, allow_rotation):
     """
     将SKU分配到最终的两种货架规格中，并计算所需货架总数。
-    v1.4.2修改: 不再返回None，而是始终返回带状态的字典。
     """
     assignments = {0: [], 1: []}
     for _, sku_group in agg_data.iterrows():
@@ -462,7 +456,6 @@ def write_results_to_excel(original_file_path, placed_sku_ids, detailed_reasons,
     except Exception as e:
         return False, None, str(e)
 
-# --- v1.4.4 新增: 预计算工作线程 ---
 def pre_calculation_worker(q, params):
     """
     在后台执行文件读取和相关性检验，避免UI卡顿。
@@ -480,24 +473,30 @@ def pre_calculation_worker(q, params):
     except Exception as e:
         q.put(("error", str(e)))
 
-def calculation_worker(q, params, raw_data, shelves):
+def calculation_worker(q, params, raw_data, shelves, agg_data=None):
     """
     在后台线程中执行主要的核心计算任务。
     """
     try:
-        h_max = params['h_max']
-        operable_data = raw_data[raw_data['H'] <= h_max].copy()
-        q.put(("log", f"\n已过滤掉 {len(raw_data) - len(operable_data)} 个高度超过 {h_max}mm 的SKU。\n"))
-        if len(operable_data) == 0: raise ValueError("所有SKU高度均超过最大允许高度。")
-        agg_data = aggregate_skus(operable_data, NUM_BINS_FOR_AGGREGATION)
+        if agg_data is None:
+            q.put(("log", "缓存未命中，正在进行SKU聚合...\n"))
+            h_max = params['h_max']
+            operable_data = raw_data[raw_data['H'] <= h_max].copy()
+            q.put(("log", f"已过滤掉 {len(raw_data) - len(operable_data)} 个高度超过 {h_max}mm 的SKU。\n"))
+            if len(operable_data) == 0: raise ValueError("所有SKU高度均超过最大允许高度。")
+            agg_data = aggregate_skus(operable_data, NUM_BINS_FOR_AGGREGATION)
+            q.put(("agg_data_computed", (agg_data, operable_data)))
+        else:
+            q.put(("log", "聚合数据缓存命中，跳过聚合步骤。\n"))
+            h_max = params['h_max']
+            operable_data = raw_data[raw_data['H'] <= h_max].copy()
+
         q.put(("log", f"数据聚合完成，聚合后规格组数量: {len(agg_data)}\n"))
 
-        # --- v1.4.3 修改: 处理ld_calculator_single的返回 ---
         q.put(("log", "--- 步骤 2: 正在计算最优L&D规格 ---\n"))
         status, ld_return_value = ld_calculator_single(agg_data, shelves, params['coverage_target'], params['allow_rotation'], q)
 
         if status == "failure":
-            # 如果L&D计算失败，说明目标过高，准备并发送详细的错误报告
             ld_result = ld_return_value
             best_attempt = ld_result["shelf"]
             max_cc = ld_result["count_coverage"]
@@ -518,9 +517,8 @@ def calculation_worker(q, params, raw_data, shelves):
                 )
             
             q.put(("error", error_msg))
-            return # 终止线程
+            return
 
-        # 如果成功，则解包结果并继续正常流程
         best_ld, best_theoretical_ld, best_theoretical_coverage = ld_return_value
         q.put(("log", f"\n最优L&D规格确定: {best_ld['Lp']:.0f}x{best_ld['Dp']:.0f}\n\n"))
 
@@ -529,7 +527,6 @@ def calculation_worker(q, params, raw_data, shelves):
             h_cand = h_calculator_coverage_driven(operable_data, h_max, params['p1'], params['p2'])
             q.put(("log", f"使用手动百分位法，最优H规格确定: {h_cand[0]:.0f}mm 和 {h_cand[1]:.0f}mm\n\n"))
         else:
-            # v1.4.3 修改: 传入理论最优L&D信息
             h_cand = h_calculator_boundary_driven(agg_data, operable_data, best_ld, h_max, params['coverage_target'], params['allow_rotation'], params, q, best_theoretical_ld, best_theoretical_coverage)
             q.put(("log", f"\n使用边界效应算法，最优H规格确定: {h_cand[0]:.0f}mm 和 {h_cand[1]:.0f}mm\n\n"))
 
@@ -572,13 +569,16 @@ def calculation_worker(q, params, raw_data, shelves):
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("货架配置优化工具 ProVersion-1.4.4 稳定版")
+        self.title("货架配置优化工具 ProVersion-1.5.2 稳定版")
         self.geometry("1150x800")
         self.grid_columnconfigure(1, weight=1); self.grid_rowconfigure(0, weight=1)
+        
+        # --- v1.5.2: 线程与缓存管理 ---
         self.queue = queue.Queue()
         self.calc_thread = None
         self.pre_calc_thread = None
         self.current_params = None
+        self.cache = {} # 缓存字典
         
         self.frame_left = ctk.CTkScrollableFrame(self, width=350, corner_radius=0, label_text="输入与配置", label_font=ctk.CTkFont(size=16, weight="bold"))
         self.frame_left.grid(row=0, column=0, rowspan=3, sticky="nsw")
@@ -626,7 +626,11 @@ class App(ctk.CTk):
         self.status_label = ctk.CTkLabel(self, text="状态: 空闲"); self.status_label.grid(row=2, column=1, padx=(10,20), pady=5, sticky="w")
         self.progressbar = ctk.CTkProgressBar(self, width=300); self.progressbar.grid(row=2, column=1, padx=(10,20), pady=5, sticky="e"); self.progressbar.set(0)
         
-        self.display_welcome_message(); self.toggle_h_params()
+        self.display_welcome_message()
+        self.toggle_h_params()
+        
+        # --- v1.5.2: 启动持久化的消息队列轮询 ---
+        self.after(100, self.process_queue)
 
     def toggle_h_params(self):
         """切换高度计算方法的参数输入框。"""
@@ -636,14 +640,13 @@ class App(ctk.CTk):
 
     def display_welcome_message(self):
         """显示欢迎信息。"""
-        self.update_textbox("""欢迎使用货架配置优化工具 ProVersion-1.4.4 稳定版！
+        self.update_textbox("""欢迎使用货架配置优化工具 ProVersion-1.5.2 稳定版！
 
 本工具旨在通过数据驱动的方式，为您推荐最优的两种货架规格，以最小化货架总数。
 
-新增“边界效应算法”参数说明:
-- 高度步长: 算法的‘搜索精度’。步长越小(如10mm)，搜索得越仔细，但耗时稍长。
-- 最小高度差值: 确保推荐的两种货架规格有实际应用价值，避免尺寸过于接近。
-- 体积权重系数 α: 0-1之间的‘决策天平’。靠近0优先覆盖更多种类，靠近1优先覆盖大体积。0.5代表两者同等重要。
+v1.5.2 更新:
+- 修复了使用缓存进行第二次计算时程序卡死的Bug。
+- 优化了线程管理和UI响应逻辑。
 
 请在左侧配置好参数后，点击“开始计算”。
 """, True)
@@ -662,8 +665,14 @@ class App(ctk.CTk):
         except: pass
 
     def update_path(self, file_type, path):
-        """更新文件路径标签。"""
+        """更新文件路径标签，并在此处处理缓存失效。"""
         if not path: return
+        
+        current_path = getattr(self, f'selected_{file_type}_file', None)
+        if path != current_path:
+            self.update_textbox("\n检测到输入文件已更改，缓存已清空。\n", clear=False)
+            self.cache = {}
+
         label = self.sku_file_path_label if file_type == 'sku' else self.shelf_file_path_label
         setattr(self, f'selected_{file_type}_file', path)
         label.configure(text=os.path.basename(path), text_color="white")
@@ -695,19 +704,20 @@ class App(ctk.CTk):
                 self.progressbar.set(1.0)
                 raw_data, shelves, corr_label, corr_val, grade = msg_content
                 
-                self.update_textbox("文件读取与检验成功。\n--- 步骤 1: L/D与H相关性检查完成 ---\n")
-                self.update_textbox(f"最强相关性: '{corr_label}', r = {corr_val:.3f}, 评级: {grade}\n")
+                self.cache['sku_path'] = self.current_params['sku_file']
+                self.cache['shelf_path'] = self.current_params['shelf_file']
+                self.cache['raw_data'] = raw_data
+                self.cache['shelves'] = shelves
+                self.cache['corr_result'] = (corr_label, corr_val, grade)
                 
-                if messagebox.askyesno("相关性检查", f"检测到L/D与H的相关性为 {grade}。\n是否继续运行？"):
-                    self.status_label.configure(text="状态: 正在初始化核心计算...")
-                    self.calc_thread = threading.Thread(target=calculation_worker, args=(self.queue, self.current_params, raw_data, shelves))
-                    self.calc_thread.start()
-                else:
-                    self.update_textbox("用户选择取消操作。\n")
-                    self.status_label.configure(text="状态: 已取消")
-                    self.button_run.configure(state="normal")
-                    return
-            
+                self.proceed_with_correlation_check()
+
+            elif msg_type == "agg_data_computed":
+                agg_data, operable_data = msg_content
+                self.cache['agg_data'] = agg_data
+                self.cache['operable_data'] = operable_data
+                self.cache['h_max'] = self.current_params['h_max']
+
             elif msg_type == "result":
                 self.display_results(*msg_content)
             
@@ -719,18 +729,16 @@ class App(ctk.CTk):
                 self.button_run.configure(state="normal")
                 self.status_label.configure(text="状态: 计算失败")
                 self.progressbar.set(0)
-                return
             
             elif msg_type == "done":
                 self.status_label.configure(text=f"状态: {msg_content}")
                 self.button_run.configure(state="normal")
                 self.progressbar.set(1)
-                return
 
         except queue.Empty:
             pass
         
-        # 持续轮询队列
+        # --- v1.5.2: 持续轮询队列 ---
         self.after(100, self.process_queue)
     
     def update_progress(self, current, total, start_time, stage_text):
@@ -743,40 +751,72 @@ class App(ctk.CTk):
         self.status_label.configure(text=f"状态: {stage_text} | 已用: {elapsed_time:.0f}s{remaining_text}")
 
     def start_calculation(self):
-        """开始计算的主函数。"""
+        """开始计算的主函数，包含缓存检查逻辑。"""
         try:
             if not hasattr(self, 'selected_sku_file') or not hasattr(self, 'selected_shelf_file'): raise ValueError("请先选择SKU和货架文件。")
             
-            # 收集所有参数
-            params = {'sku_file': self.selected_sku_file, 'shelf_file': self.selected_shelf_file}
-            params.update({k: float(e.get()) for k, e in {'coverage_target': self.entry_coverage, 'h_max': self.entry_hmax}.items()})
-            params['coverage_target'] /= 100.0
-            params['allow_rotation'] = self.check_allow_rotation.get() == 1
-            params['h_method'] = self.h_method_var.get()
-            params['cols'] = {key: entry.get() for key, entry in self.col_entries.items()}
-
-            if not all(params['cols'].values()): raise ValueError("所有Excel列名都不能为空。")
-            if params['h_method'] == 'manual':
-                params.update({k: float(e.get()) for k, e in {'p1': self.entry_p1, 'p2': self.entry_p2}.items()})
-            else:
-                params.update({k: float(e.get()) for k, e in {'height_step': self.entry_height_step, 'min_height_diff': self.entry_min_height_diff, 'volume_weight': self.entry_volume_weight}.items()})
+            params = self.collect_params()
+            self.current_params = params
             
-            self.current_params = params # 保存参数以供后续使用
-
-            # --- v1.4.4 修改: 启动预计算线程 ---
             self.update_textbox("", True)
             self.button_run.configure(state="disabled")
-            self.status_label.configure(text="状态: 正在初始化...")
             self.progressbar.set(0)
-            
-            self.pre_calc_thread = threading.Thread(target=pre_calculation_worker, args=(self.queue, self.current_params))
-            self.pre_calc_thread.start()
-            self.after(100, self.process_queue)
+
+            if (self.cache.get('sku_path') == params['sku_file'] and
+                self.cache.get('shelf_path') == params['shelf_file']):
+                self.update_textbox("文件缓存命中，跳过文件读取和检验步骤。\n")
+                self.proceed_with_correlation_check()
+            else:
+                self.status_label.configure(text="状态: 正在初始化...")
+                self.pre_calc_thread = threading.Thread(target=pre_calculation_worker, args=(self.queue, self.current_params))
+                self.pre_calc_thread.start()
 
         except Exception as e:
             messagebox.showerror("输入或文件错误", f"发生错误: {e}")
             self.button_run.configure(state="normal")
             self.status_label.configure(text="状态: 空闲")
+
+    def collect_params(self):
+        """从UI收集所有参数。"""
+        params = {'sku_file': self.selected_sku_file, 'shelf_file': self.selected_shelf_file}
+        params.update({k: float(e.get()) for k, e in {'coverage_target': self.entry_coverage, 'h_max': self.entry_hmax}.items()})
+        params['coverage_target'] /= 100.0
+        params['allow_rotation'] = self.check_allow_rotation.get() == 1
+        params['h_method'] = self.h_method_var.get()
+        params['cols'] = {key: entry.get() for key, entry in self.col_entries.items()}
+
+        if not all(params['cols'].values()): raise ValueError("所有Excel列名都不能为空。")
+        if params['h_method'] == 'manual':
+            params.update({k: float(e.get()) for k, e in {'p1': self.entry_p1, 'p2': self.entry_p2}.items()})
+        else:
+            params.update({k: float(e.get()) for k, e in {'height_step': self.entry_height_step, 'min_height_diff': self.entry_min_height_diff, 'volume_weight': self.entry_volume_weight}.items()})
+        return params
+
+    def proceed_with_correlation_check(self):
+        """显示相关性检验结果并决定是否继续。"""
+        corr_label, corr_val, grade = self.cache['corr_result']
+        self.update_textbox("--- 步骤 1: L/D与H相关性检查完成 ---\n")
+        self.update_textbox(f"最强相关性: '{corr_label}', r = {corr_val:.3f}, 评级: {grade}\n")
+        
+        if messagebox.askyesno("相关性检查", f"检测到L/D与H的相关性为 {grade}。\n是否继续运行？"):
+            self.start_core_calculation()
+        else:
+            self.update_textbox("用户选择取消操作。\n")
+            self.status_label.configure(text="状态: 已取消")
+            self.button_run.configure(state="normal")
+
+    def start_core_calculation(self):
+        """启动核心计算，包含对聚合数据的缓存检查。"""
+        self.status_label.configure(text="状态: 正在初始化核心计算...")
+        raw_data = self.cache['raw_data']
+        shelves = self.cache['shelves']
+        
+        agg_data_cache = None
+        if self.cache.get('h_max') == self.current_params['h_max']:
+            agg_data_cache = self.cache.get('agg_data')
+
+        self.calc_thread = threading.Thread(target=calculation_worker, args=(self.queue, self.current_params, raw_data, shelves, agg_data_cache))
+        self.calc_thread.start()
 
     def display_results(self, two_shelves, solution, coverage_target):
         """显示最终的优化方案结果。"""
