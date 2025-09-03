@@ -1,0 +1,79 @@
+{
+  "version": "1.3.3",
+  "file_config": {
+    "data_file": "C:/Users/14162/Desktop/Schenker/Task3-IKEA&KM/Storage Template 1.xlsx",
+    "sku_sheet_name": "Inventory",
+    "shelf_sheet_name": "LocationMaster"
+  },
+  "core_params": {
+    "coverage_target": "90",
+    "h_max": "2300",
+    "allow_rotation": 1
+  },
+  "ld_method": {
+    "method": "complementary",
+    "area_threshold": "0.7",
+    "size_threshold": "0.8"
+  },
+  "h_method": {
+    "method": "three_dimensional",
+    "height_step_3d": "5",
+    "min_height_diff_3d": "150",
+    "count_weight": "0.25",
+    "volume_weight_3d": "0.25",
+    "height_weight": "0.5",
+    "min_count_utilization": "80",
+    "height_step": "10",
+    "min_height_diff": "150",
+    "volume_weight": "0.5",
+    "p1": "50",
+    "p2": "90"
+  },
+  "default_params": {
+    "default_carton_l": "600",
+    "default_carton_d": "400",
+    "default_carton_h": "300",
+    "default_carton_w": "20",
+    "default_carton_v": "0.072",
+    "default_pallet_l": "1200",
+    "default_pallet_d": "1000",
+    "default_pallet_h": "1800",
+    "default_pallet_w": "500",
+    "default_pallet_v": "2.16"
+  },
+  "pallet_params": {
+    "pallet_l": "1200",
+    "pallet_d": "1000",
+    "pallet_h": "1800",
+    "min_pallet_util": "30",
+    "mixed_packing_threshold": "5"
+  },
+  "warehouse_params": {
+    "warehouse_h": "6000",
+    "bottom_clearance": "150",
+    "layer_headroom": "100",
+    "shelf_thickness": "50"
+  },
+  "excel_columns": {
+    "sku_id": "SKU",
+    "pieces_per_unit": "Total Unit(pcs)",
+    "allow_carton": "Storage by Carton",
+    "allow_pallet": "Storage by Pallet",
+    "pieces_per_carton": "Inner Pack per Outer Carton",
+    "cartons_per_pallet": "Outer Carton per Pallet",
+    "carton_l": "Outer Carton Length(mm)",
+    "carton_d": "Outer Carton Width(mm)",
+    "carton_h": "Outer Carton Height(mm)",
+    "carton_w": "Outer Carton Weight(kg)",
+    "carton_v": "Outer Carton Volume(cbm)",
+    "pallet_l": "Pallet Length(mm)",
+    "pallet_d": "Pallet Width(mm)",
+    "pallet_h": "Pallet Height(mm)",
+    "pallet_w": "Pallet Weight(kg)",
+    "pallet_v": "Pallet Volume(cbm)",
+    "shelf_type": "Storage Method",
+    "shelf_l": "Location Width(mm)",
+    "shelf_d": "Location Depth(mm)",
+    "shelf_w": "Location Weight Limit(kg)"
+  }
+}

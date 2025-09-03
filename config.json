@@ -1,0 +1,14 @@
+{
+    "sku_sheet_name": "SKU_Data",
+    "shelf_sheet_name": "Shelf_Data",
+    "col_sku_id": "SKU_ID",
+    "col_l": "Length",
+    "col_d": "Width",
+    "col_h": "Height",
+    "col_qty": "Quantity",
+    "ld_algo": "\u5355\u4e00\u8d27\u67b6\u7b97\u6cd5",
+    "h_algo": "\u624b\u52a8\u767e\u5206\u4f4d\u7b97\u6cd5",
+    "coverage_target": 90.0,
+    "pallet_threshold": 30.0,
+    "warehouse_height": 6000
+}
