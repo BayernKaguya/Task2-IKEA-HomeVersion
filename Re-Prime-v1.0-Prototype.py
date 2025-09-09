@@ -41,9 +41,23 @@ LAST_SESSION_FILE = "last_session_params.json"
 # --- 核心计算逻辑 (后台线程运行) ---
 # #############################################################################
 
+import pandas as pd
+import time
+
 def analyze_packing_decision(data, pallet_decimal_threshold, q):
     """
     装箱/装托判定算法 - 基于两列Y/N控制
+    
+    步骤：
+    1. 读取SKU的可装箱和可装托标识（Y/N）
+    2. 根据标识组合进行判定：
+       - 只能装箱：can_box=Y, can_pallet=N
+       - 只能装托：can_box=N, can_pallet=Y
+       - 都可以：can_box=Y, can_pallet=Y → 根据装托数小数部分判定
+       - 都不可以：can_box=N, can_pallet=N → 错误，跳过
+    3. 对于都可以的SKU，根据装托数小数部分与阈值比较进行判定
+    
+    返回：packing_decisions字典，key为sku_id，value为判定结果
     """
     q.put(("log", "--- 步骤 1: 装箱/装托判定分析 (基于两列Y/N控制) ---\n"))
     
@@ -57,294 +71,548 @@ def analyze_packing_decision(data, pallet_decimal_threshold, q):
     
     for _, sku in data.iterrows():
         sku_id = sku['sku_id']
-        can_box = str(sku['can_box']).strip().upper()
-        can_pallet = str(sku['can_pallet']).strip().upper()
+        can_box = sku['can_box'].strip().upper()
+        can_pallet = sku['can_pallet'].strip().upper()
         
+        # 第一步：根据两列Y/N的组合进行初步判定
         if can_box == 'Y' and can_pallet == 'N':
-            packing_decisions[sku_id] = {'decision': 'box_only', 'final_box_count': sku['box_count'], 'final_pallet_count': 0, 'remaining_box_count': 0}
+            # 只能装箱
+            packing_decisions[sku_id] = {
+                'decision': 'box_only',
+                'final_box_count': sku['box_count'],
+                'final_pallet_count': 0,
+                'remaining_box_count': 0
+            }
             box_only_count += 1
             continue
         elif can_box == 'N' and can_pallet == 'Y':
-            packing_decisions[sku_id] = {'decision': 'pallet_only', 'final_box_count': 0, 'final_pallet_count': sku['pallet_count'], 'remaining_box_count': 0}
+            # 只能装托
+            packing_decisions[sku_id] = {
+                'decision': 'pallet_only',
+                'final_box_count': 0,
+                'final_pallet_count': sku['pallet_count'],
+                'remaining_box_count': 0
+            }
             pallet_only_count += 1
             continue
         elif can_box == 'N' and can_pallet == 'N':
+            # 都不可以 - 错误情况，跳过并记录
             error_skus.append(sku_id)
             error_count += 1
             continue
         elif can_box == 'Y' and can_pallet == 'Y':
+            # 都可以 - 需要根据数据判定
             pass
         else:
+            # 其他无效组合（非 Y/N 字符）
             error_skus.append(sku_id)
             error_count += 1
             continue
         
+        # 第二步：对于都可以的SKU，读取装箱数、装托数、单托箱数
         box_count = sku['box_count']
         pallet_count = sku['pallet_count']
         boxes_per_pallet = sku['boxes_per_pallet']
         
-        pallet_decimal = pallet_count - int(pallet_count)
+        # 第三步：根据装托数小数部分判定
+        pallet_decimal = pallet_count - int(pallet_count)  # 获取小数部分
         
         if pallet_decimal >= pallet_decimal_threshold:
-            final_pallet_count = math.ceil(pallet_count)
-            packing_decisions[sku_id] = {'decision': 'pallet_only', 'final_box_count': 0, 'final_pallet_count': final_pallet_count, 'remaining_box_count': 0}
+            # 小数部分 >= 阈值，采用纯装托
+            final_pallet_count = int(pallet_count) + 1  # 向上取整
+            packing_decisions[sku_id] = {
+                'decision': 'pallet_only',
+                'final_box_count': 0,
+                'final_pallet_count': final_pallet_count,
+                'remaining_box_count': 0
+            }
             pure_pallet_count += 1
         else:
-            final_pallet_count = int(pallet_count)
+            # 小数部分 < 阈值，采用混装
+            final_pallet_count = int(pallet_count)  # 整数部分
+            # 剩余装箱数 = 装箱数 - 装托数 × 单托箱数
             remaining_box_count = box_count - pallet_count * boxes_per_pallet
-            remaining_box_count = max(0, remaining_box_count)
-            packing_decisions[sku_id] = {'decision': 'mixed', 'final_box_count': remaining_box_count, 'final_pallet_count': final_pallet_count, 'remaining_box_count': remaining_box_count}
+            remaining_box_count = max(0, remaining_box_count)  # 确保不为负数
+            
+            packing_decisions[sku_id] = {
+                'decision': 'mixed',
+                'final_box_count': remaining_box_count,
+                'final_pallet_count': final_pallet_count,
+                'remaining_box_count': remaining_box_count
+            }
             mixed_packing_count += 1
     
+    # 输出统计结果
     total_skus = len(data)
-    valid_skus = total_skus - error_count if total_skus > error_count else 1
+    valid_skus = total_skus - error_count
     q.put(("log", f"装箱/装托判定完成，共分析 {total_skus} 个SKU：\n"))
     q.put(("log", f"  - 只能装箱：{box_only_count} 个 ({box_only_count/valid_skus*100:.1f}% of valid)\n"))
-    q.put(("log", f"  - 只能装托：{pallet_only_count + pure_pallet_count} 个 ({(pallet_only_count + pure_pallet_count)/valid_skus*100:.1f}% of valid)\n"))
-    q.put(("log", f"  - 托箱混装：{mixed_packing_count} 个 ({mixed_packing_count/valid_skus*100:.1f}% of valid)\n"))
+    q.put(("log", f"  - 只能装托：{pallet_only_count} 个 ({pallet_only_count/valid_skus*100:.1f}% of valid)\n"))
+    q.put(("log", f"  - 纯装托（小数部分≥{pallet_decimal_threshold}）：{pure_pallet_count} 个 ({pure_pallet_count/valid_skus*100:.1f}% of valid)\n"))
+    q.put(("log", f"  - 托箱混装（小数部分<{pallet_decimal_threshold}）：{mixed_packing_count} 个 ({mixed_packing_count/valid_skus*100:.1f}% of valid)\n"))
     
     if error_count > 0:
         q.put(("log", f"  - 错误/跳过的SKU：{error_count} 个 ({error_count/total_skus*100:.1f}% of total)\n"))
+        q.put(("log", f"    错误原因：装箱和装托都不允许或数据格式错误\n"))
     
+    # 总结需要的货架类型
     needs_box_shelves = box_only_count + mixed_packing_count > 0
     needs_pallet_shelves = pallet_only_count + pure_pallet_count + mixed_packing_count > 0
+    
+    q.put(("log", f"需要的货架类型：\n"))
+    if needs_box_shelves:
+        q.put(("log", f"  - 需要装箱货架（B类型）\n"))
+    if needs_pallet_shelves:
+        q.put(("log", f"  - 需要装托货架（A类型）\n"))
     
     result_summary = {
         'decisions': packing_decisions,
         'needs_box_shelves': needs_box_shelves,
         'needs_pallet_shelves': needs_pallet_shelves,
         'error_skus': error_skus,
-        'stats': {'box_only': box_only_count, 'pallet_only': pallet_only_count + pure_pallet_count, 'mixed': mixed_packing_count, 'error': error_count}
+        'stats': {
+            'box_only': box_only_count,
+            'pallet_only': pallet_only_count,
+            'pure_pallet': pure_pallet_count,
+            'mixed': mixed_packing_count,
+            'error': error_count
+        }
     }
+    
     return result_summary
 
+
 def split_data_by_packing_decision(data, packing_decisions, q):
-    """根据装箱装托判定结果将数据分组 (为每个分组添加对应的L,D,H,W,V)"""
+    """
+    根据装箱装托判定结果将数据分组，并为每组添加对应的L、D、H、W、V列
+    
+    Args:
+        data: 包含装托和装箱数据的DataFrame
+        packing_decisions: 装箱装托判定结果字典
+        q: 日志队列
+    
+    Returns:
+        dict: 包含三个分组的数据
+        {
+            'box_only_data': DataFrame,    # 纯装箱数据（使用box_*列）
+            'pallet_only_data': DataFrame, # 纯装托数据（使用pallet_*列）
+            'mixed_data': DataFrame        # 混装数据（需特殊处理）
+        }
+    """
     q.put(("log", "--- 步骤 2: 数据分组处理 ---\n"))
     
-    box_only_skus, pallet_only_skus, mixed_skus = [], [], []
+    box_only_skus = []
+    pallet_only_skus = []
+    mixed_skus = []
+    
+    # 根据判定结果分组SKU
     for sku_id, decision_info in packing_decisions.items():
         decision = decision_info['decision']
-        if decision == 'box_only': box_only_skus.append(sku_id)
-        elif decision == 'pallet_only': pallet_only_skus.append(sku_id)
-        elif decision == 'mixed': mixed_skus.append(sku_id)
-
-    def create_group_data(sku_list, use_pallet_data, group_name=""):
-        if not sku_list: return pd.DataFrame()
+        if decision == 'box_only':
+            box_only_skus.append(sku_id)
+        elif decision == 'pallet_only':
+            pallet_only_skus.append(sku_id)
+        elif decision == 'mixed':
+            mixed_skus.append(sku_id)
+    
+    # 创建三个分组的数据集
+    def create_group_data(sku_list, use_pallet_data=False, group_name=""):
+        if not sku_list:
+            return pd.DataFrame()
+        
         group_data = data[data['sku_id'].isin(sku_list)].copy()
-        prefix = 'pallet' if use_pallet_data else 'box'
-        group_data['L'] = group_data[f'{prefix}_l']
-        group_data['D'] = group_data[f'{prefix}_d']
-        group_data['H'] = group_data[f'{prefix}_h']
-        group_data['W'] = group_data[f'{prefix}_w']
-        group_data['V'] = group_data[f'{prefix}_v']
+        
+        if use_pallet_data:
+            # 使用装托数据作为L、D、H、W、V
+            group_data['L'] = group_data['pallet_l']
+            group_data['D'] = group_data['pallet_d']
+            group_data['H'] = group_data['pallet_h']
+            group_data['W'] = group_data['pallet_w']
+            group_data['V'] = group_data['pallet_v']
+        else:
+            # 使用装箱数据作为L、D、H、W、V
+            group_data['L'] = group_data['box_l']
+            group_data['D'] = group_data['box_d']
+            group_data['H'] = group_data['box_h']
+            group_data['W'] = group_data['box_w']
+            group_data['V'] = group_data['box_v']
+        
         q.put(("log", f"  - {group_name}：{len(group_data)} 个SKU\n"))
         return group_data
-
-    # 纯装箱组，使用箱子尺寸
+    
+    # 创建三个分组
     box_only_data = create_group_data(box_only_skus, use_pallet_data=False, group_name="纯装箱组")
-    # 纯装托组，使用托盘尺寸
     pallet_only_data = create_group_data(pallet_only_skus, use_pallet_data=True, group_name="纯装托组")
-    # 混装组，优先使用托盘尺寸（通常是主要约束）
-    mixed_data = create_group_data(mixed_skus, use_pallet_data=True, group_name="混装组(使用托盘尺寸)")
+    
+    # 混装组的特殊处理 - 这里可以根据业务需求决定使用哪种数据
+    # 方案1：优先使用装托数据（因为装托通常体积更大，更重要）
+    # 方案2：根据数量比例决定
+    # 这里采用方案1
+    mixed_data = create_group_data(mixed_skus, use_pallet_data=True, group_name="混装组（使用装托数据）")
+    
+    grouped_data = {
+        'box_only_data': box_only_data,
+        'pallet_only_data': pallet_only_data,
+        'mixed_data': mixed_data
+    }
+    
+    q.put(("log", f"数据分组完成，共 {len(box_only_skus) + len(pallet_only_skus) + len(mixed_skus)} 个有效SKU\n"))
+    
+    return grouped_data
 
-    q.put(("log", f"数据分组完成。\n"))
-    return {'box_only_data': box_only_data, 'pallet_only_data': pallet_only_data, 'mixed_data': mixed_data}
 
 def split_shelves_by_type(shelves, pallet_char, box_char, q):
-    """根据货架类型标识将货架分组"""
+    """
+    根据货架类型标识将货架分组
+    
+    Args:
+        shelves: 所有货架列表
+        pallet_char: 装托货架标识字符（如'A'）
+        box_char: 装箱货架标识字符（如'B'）
+        q: 日志队列
+    
+    Returns:
+        dict: 包含两组货架的字典
+        {
+            'pallet_shelves': list,  # A类型货架（装托）
+            'box_shelves': list      # B类型货架（装箱）
+        }
+    """
     q.put(("log", "--- 步骤 3: 货架类型分组 ---\n"))
-    pallet_shelves, box_shelves, other_shelves = [], [], []
+    
+    pallet_shelves = []
+    box_shelves = []
+    other_shelves = []
+    
     for shelf in shelves:
-        shelf_type = str(shelf.get('shelf_type', '')).strip()
-        if pallet_char and pallet_char in shelf_type: pallet_shelves.append(shelf)
-        elif box_char and box_char in shelf_type: box_shelves.append(shelf)
-        else: other_shelves.append(shelf)
+        shelf_type = shelf['shelf_type'].strip()
+        
+        if shelf_type == pallet_char:
+            pallet_shelves.append(shelf)
+        elif shelf_type == box_char:
+            box_shelves.append(shelf)
+        else:
+            other_shelves.append(shelf)
     
     q.put(("log", f"货架分组完成：\n"))
     q.put(("log", f"  - 装托货架('{pallet_char}')：{len(pallet_shelves)} 种\n"))
     q.put(("log", f"  - 装箱货架('{box_char}')：{len(box_shelves)} 种\n"))
+    
     if other_shelves:
-        q.put(("log", f"  - 其他/未识别类型货架：{len(other_shelves)} 种（将被忽略）\n"))
+        q.put(("log", f"  - 其他类型货架：{len(other_shelves)} 种（将被忽略）\n"))
     
-    return {'pallet_shelves': pallet_shelves, 'box_shelves': box_shelves}
-
-# --- MODIFICATION D: 改造D，统一定义聚合函数 ---
-def aggregate_sku_data(data):
-    """精细聚合：按L/D/H/W/V尺寸组合进行分组"""
-    if data.empty: return pd.DataFrame()
-    agg_data = data.groupby(['L', 'D', 'H', 'W', 'V']).agg(
-        count=('L', 'size'),
-        sku_ids=('sku_id', lambda x: list(x))
-    ).reset_index()
-    return agg_data
-
-def aggregate_skus_with_binning(data, num_bins):
-    """带分箱的聚合：对L/D进行分箱降噪"""
-    if data.empty: return pd.DataFrame()
-    data['l_bin'] = pd.cut(data['L'], bins=num_bins, labels=False, duplicates='drop')
-    data['d_bin'] = pd.cut(data['D'], bins=num_bins, labels=False, duplicates='drop')
-    agg_data = data.groupby(['l_bin', 'd_bin']).agg(
-        L=('L', 'median'), D=('D', 'median'), H=('H', 'median'), W=('W', 'median'), V=('V', 'median'),
-        count=('L', 'size'),
-        sku_ids=('sku_id', lambda x: list(x))
-    ).reset_index()
-    return agg_data
-
-# --- MODIFICATION A: 改造A，补全评估函数返回值 ---
-def final_allocation_and_counting(agg_data, final_shelves, coverage_target, allow_rotation):
-    """
-    评估货架组合方案并返回完整结果 (旧称 evaluate_shelf_combination)
-    - 返回值已按“数据契约”补齐
-    """
-    num_shelf_types = len(final_shelves)
-    assignments = {i: [] for i in range(num_shelf_types)}
-    
-    for _, sku_group in agg_data.iterrows():
-        possible_fits = []
-        orientations = [{'w': sku_group['L'], 'd': sku_group['D']}]
-        if allow_rotation and sku_group['L'] != sku_group['D']:
-            orientations.append({'w': sku_group['D'], 'd': sku_group['L']})
-        
-        for i, shelf in enumerate(final_shelves):
-            if sku_group['W'] > shelf['Wp'] or sku_group['H'] > shelf['H']: continue
-            for ori in orientations:
-                w, d = ori['w'], ori['d']
-                if w <= shelf['Lp'] and d <= shelf['Dp']:
-                    rem_space = shelf['Lp'] * shelf['Dp'] - w * d
-                    possible_fits.append({'shelf_idx': i, 'width': w, 'rem_space': rem_space})
-        
-        if not possible_fits: continue
-        best_fit = min(possible_fits, key=lambda x: x['rem_space'])
-        item_to_place = (sku_group.to_dict(), best_fit['width'], int(sku_group['count']))
-        assignments[best_fit['shelf_idx']].append(item_to_place)
-
-    total_sku_count = agg_data['count'].sum()
-    total_sku_volume = (agg_data['V'] * agg_data['count']).sum()
-    placed_count = sum(item[2] for lst in assignments.values() for item in lst)
-    placed_volume = sum(item[0]['V'] * item[2] for lst in assignments.values() for item in lst)
-    coverage_count = placed_count / total_sku_count if total_sku_count > 0 else 0
-    coverage_volume = placed_volume / total_sku_volume if total_sku_volume > 0 else 0
-
-    # 补全字段
-    placed_sku_ids = {sid for lst in assignments.values() for item in lst for sid in item[0]['sku_ids']}
-    sku_shelf_assignments = {
-        sid: shelf_idx 
-        for shelf_idx, lst in assignments.items() 
-        for item in lst 
-        for sid in item[0]['sku_ids']
+    grouped_shelves = {
+        'pallet_shelves': pallet_shelves,
+        'box_shelves': box_shelves
     }
-
-    if total_sku_count == 0 or placed_count < total_sku_count * coverage_target or placed_volume < total_sku_volume * coverage_target:
-        return {
-            'status': 'failure', 'counts': [0] * num_shelf_types, 'coverage_count': coverage_count, 
-            'coverage_volume': coverage_volume, 'placed_sku_ids': placed_sku_ids, 
-            'sku_shelf_assignments': sku_shelf_assignments, 'assignments': assignments, 'final_shelves': final_shelves
-        }
-
-    final_counts = [run_bulk_ffd_packing(assignments.get(i, []), final_shelves[i]['Lp']) for i in range(num_shelf_types)]
     
-    return {
-        'status': 'success', 'counts': final_counts, 'coverage_count': coverage_count, 
-        'coverage_volume': coverage_volume, 'placed_sku_ids': placed_sku_ids, 
-        'sku_shelf_assignments': sku_shelf_assignments, 'assignments': assignments, 'final_shelves': final_shelves
-    }
+    return grouped_shelves
 
-def ld_calculator_complementary(agg_data, shelves, coverage_target, allow_rotation, q, params):
-    """L&D互补求解器，寻找最优的两种货架组合"""
-    q.put(("log", "--- 开始L&D互补求解 ---\n"))
-    total_sku_count = agg_data['count'].sum()
-    if total_sku_count == 0:
-        return "skip", None, None
 
-    # Step 1: 筛选出所有能独立满足覆盖率的货架
-    candidate_shelves = []
-    total_shelves_to_eval = len(shelves)
-    start_time = time.time()
-    for i, shelf in enumerate(shelves):
-        fittable_skus = [item for item in agg_data.to_dict('records') if (item['L'] <= shelf['Lp'] and item['D'] <= shelf['Dp']) or \
-                         (allow_rotation and item['D'] <= shelf['Lp'] and item['L'] <= shelf['Dp'])]
-        placed_count = sum(item['count'] for item in fittable_skus)
-        if placed_count >= total_sku_count * coverage_target:
-            candidate_shelves.append(shelf)
-        q.put(("progress", (i + 1, total_shelves_to_eval, start_time, f"L&D互补-初筛 {i+1}/{total_shelves_to_eval}")))
-
-    if len(candidate_shelves) < 2:
-        q.put(("log", "警告: 满足覆盖率的候选L&D货架不足2种，无法进行互补计算。\n"))
-        return "failure", None, None
-
-    # Step 2: 评估候选货架的两两组合
-    shelf_combinations = list(combinations(candidate_shelves, 2))
-    q.put(("log", f"初筛后得到 {len(candidate_shelves)} 种候选货架，将评估 {len(shelf_combinations)} 种组合。\n"))
-
-    best_solution = None
-    min_total_shelves = float('inf')
-    best_combo_shelves = None
+def process_grouped_calculations(grouped_data, grouped_shelves, coverage_target, allow_rotation, params, q):
+    """
+    分组独立运行L&D互补算法
     
-    total_combos_to_eval = len(shelf_combinations)
-    start_time_combo = time.time()
-    for i, (s1, s2) in enumerate(shelf_combinations):
-        two_shelves = [s1, s2]
-        # 调用已改造的评估函数
-        solution = final_allocation_and_counting(agg_data, two_shelves, coverage_target, allow_rotation)
-        
-        if solution['status'] == 'success':
-            total_shelves = sum(solution['counts'])
-            if total_shelves < min_total_shelves:
-                min_total_shelves = total_shelves
-                best_solution = solution
-                best_combo_shelves = (s1, s2)
-        q.put(("progress", (i + 1, total_combos_to_eval, start_time_combo, f"L&D互补-评估组合 {i+1}/{total_combos_to_eval}")))
-
-    if best_solution:
-        q.put(("log", "--- L&D互补求解完成 ---\n"))
-        return "success", best_combo_shelves, best_solution
-    else:
-        q.put(("log", "--- L&D互补求解失败: 未找到成功的货架组合 ---\n"))
-        return "failure", None, None
-
-
-def process_grouped_calculations(grouped_data, grouped_shelves, coverage_target, allow_rotation, q, params):
-    """分组独立运行计算，并返回符合契约的结果"""
+    Args:
+        grouped_data: 分组后的SKU数据
+        grouped_shelves: 分组后的货架数据
+        coverage_target: 覆盖率目标
+        allow_rotation: 是否允许旋转
+        params: 其他参数
+        q: 日志队列
+    
+    Returns:
+        dict: 各组的计算结果
+    """
+    q.put(("log", "--- 步骤 4: 分组独立计算L&D互补 ---\n"))
+    
     results = {}
     
-    # MODIFICATION D: 改造D，统一使用带分箱的聚合方法
-    agg_func = aggregate_skus_with_binning
-
-    group_map = {
-        "box_only": ("纯装箱组", grouped_data['box_only_data'], grouped_shelves['box_shelves']),
-        "pallet_only": ("纯装托组", grouped_data['pallet_only_data'], grouped_shelves['pallet_shelves']),
-        "mixed": ("混装组", grouped_data['mixed_data'], grouped_shelves['pallet_shelves']) # 混装组优先使用托盘货架
-    }
-
-    for group_key, (name, data, shelves) in group_map.items():
-        if data.empty or not shelves:
-            results[group_key] = ("skip", None, None)
-            q.put(("log", f"跳过{name}（无数据或无对应货架）。\n"))
-            continue
-
-        q.put(("log", f"开始处理 {name}...\n"))
-        agg_data = agg_func(data, NUM_BINS_FOR_AGGREGATION)
-        
-        # 假设L&D互补是主要算法，后续可扩展
-        status, best_shelves, solution = ld_calculator_complementary(agg_data, shelves, coverage_target, allow_rotation, q, params)
-        
-        # MODIFICATION A: 改造A，确保返回的元组第三项是完整的 solution
-        results[group_key] = (status, best_shelves, solution)
-        q.put(("log", f"{name}处理完成，状态: {status}\n"))
-
+    # 处理纯装箱组
+    if not grouped_data['box_only_data'].empty and grouped_shelves['box_shelves']:
+        q.put(("log", "开始处理纯装箱组...\n"))
+        # 注意：这里需要调用聚合函数将SKU数据转换为计算所需的格式
+        # 后续代码需要修改：需要添加数据聚合步骤
+        agg_box_data = aggregate_sku_data(grouped_data['box_only_data'])  # 需要实现此函数
+        box_result = ld_calculator_complementary(
+            agg_box_data, 
+            grouped_shelves['box_shelves'], 
+            coverage_target, 
+            allow_rotation, 
+            q, 
+            params
+        )
+        results['box_only'] = box_result
+        q.put(("log", f"纯装箱组计算完成：{box_result[0]}\n"))
+    else:
+        results['box_only'] = ("skip", "无装箱数据或无装箱货架")
+        q.put(("log", "跳过纯装箱组（无数据或无货架）\n"))
+    
+    # 处理纯装托组
+    if not grouped_data['pallet_only_data'].empty and grouped_shelves['pallet_shelves']:
+        q.put(("log", "开始处理纯装托组...\n"))
+        agg_pallet_data = aggregate_sku_data(grouped_data['pallet_only_data'])  # 需要实现此函数
+        pallet_result = ld_calculator_complementary(
+            agg_pallet_data, 
+            grouped_shelves['pallet_shelves'], 
+            coverage_target, 
+            allow_rotation, 
+            q, 
+            params
+        )
+        results['pallet_only'] = pallet_result
+        q.put(("log", f"纯装托组计算完成：{pallet_result[0]}\n"))
+    else:
+        results['pallet_only'] = ("skip", "无装托数据或无装托货架")
+        q.put(("log", "跳过纯装托组（无数据或无货架）\n"))
+    
+    # 处理混装组 - 这里可以根据业务需求选择策略
+    if not grouped_data['mixed_data'].empty:
+        q.put(("log", "开始处理混装组...\n"))
+        # 策略1：优先使用装托货架（因为混装组使用的是装托数据）
+        if grouped_shelves['pallet_shelves']:
+            agg_mixed_data = aggregate_sku_data(grouped_data['mixed_data'])  # 需要实现此函数
+            mixed_result = ld_calculator_complementary(
+                agg_mixed_data, 
+                grouped_shelves['pallet_shelves'], 
+                coverage_target, 
+                allow_rotation, 
+                q, 
+                params
+            )
+            results['mixed'] = mixed_result
+            q.put(("log", f"混装组计算完成（使用装托货架）：{mixed_result[0]}\n"))
+        # 策略2：如果没有装托货架，尝试装箱货架（需要重新处理数据）
+        elif grouped_shelves['box_shelves']:
+            q.put(("log", "无装托货架，尝试使用装箱货架处理混装组...\n"))
+            # 重新处理混装组数据，使用装箱尺寸
+            mixed_data_for_box = grouped_data['mixed_data'].copy()
+            mixed_data_for_box['L'] = mixed_data_for_box['box_l']
+            mixed_data_for_box['D'] = mixed_data_for_box['box_d']
+            mixed_data_for_box['H'] = mixed_data_for_box['box_h']
+            mixed_data_for_box['W'] = mixed_data_for_box['box_w']
+            mixed_data_for_box['V'] = mixed_data_for_box['box_v']
+            
+            agg_mixed_data = aggregate_sku_data(mixed_data_for_box)
+            mixed_result = ld_calculator_complementary(
+                agg_mixed_data, 
+                grouped_shelves['box_shelves'], 
+                coverage_target, 
+                allow_rotation, 
+                q, 
+                params
+            )
+            results['mixed'] = mixed_result
+            q.put(("log", f"混装组计算完成（使用装箱货架和装箱数据）：{mixed_result[0]}\n"))
+        else:
+            results['mixed'] = ("skip", "无可用货架处理混装组")
+            q.put(("log", "跳过混装组（无可用货架）\n"))
+    else:
+        results['mixed'] = ("skip", "无混装数据")
+        q.put(("log", "跳过混装组（无数据）\n"))
+    
     return results
 
-def main_calculation_with_grouping(data, shelves, coverage_target, allow_rotation, pallet_char, box_char, params, q):
+
+def aggregate_sku_data(data):
     """
-    重构后的主计算流程，返回值遵循“数据契约”
+    将SKU数据聚合为计算所需的格式
+    这个函数需要根据原有的数据聚合逻辑来实现
+    
+    Args:
+        data: 包含L、D、H、W、V列的SKU数据
+    
+    Returns:
+        DataFrame: 聚合后的数据，包含count列
     """
-    q.put(("log", "\n" + "="*25 + " 开始执行分组计算流程 " + "="*25 + "\n"))
+    # 按照L、D、H、W、V的组合进行分组，计算每组的数量
+    agg_data = data.groupby(['L', 'D', 'H', 'W', 'V']).size().reset_index(name='count')
+    return agg_data
+
+def calculate_pallet_utilization(sku, pallet_params):
+    """
+    v1.0.0: 计算单个SKU在标准托盘上的满托空间利用率。
+    """
+    try:
+        pallet_l, pallet_d, pallet_h = pallet_params['L'], pallet_params['D'], pallet_params['H']
+        n1 = math.floor(pallet_l / sku['L']) * math.floor(pallet_d / sku['D'])
+        n2 = math.floor(pallet_l / sku['D']) * math.floor(pallet_d / sku['L'])
+        n_per_layer = max(n1, n2)
+        if n_per_layer == 0: return 0
+        num_layers = math.floor(pallet_h / sku['H'])
+        if num_layers == 0: return 0
+        total_sku_volume = n_per_layer * num_layers * sku['V']
+        pallet_space_volume = pallet_l * pallet_d * pallet_h
+        return total_sku_volume / pallet_space_volume if pallet_space_volume > 0 else 0
+    except (ValueError, TypeError, ZeroDivisionError):
+        return 0
+
+def preprocess_and_decide_storage_mode(raw_data, pallet_params, q):
+    """
+    v1.0.0: 预处理模块，决策SKU的存储模式。
+    """
+    q.put(("log", "--- 步骤 1a: 开始进行存储模式决策 ---\n"))
+    carton_only_mask = raw_data['allow_carton'] & ~raw_data['allow_pallet']
+    pallet_only_mask = raw_data['allow_pallet'] & ~raw_data['allow_carton']
+    choice_mask = raw_data['allow_carton'] & raw_data['allow_pallet']
+    
+    skus_for_pallet_indices = list(raw_data[pallet_only_mask].index)
+    skus_for_carton_indices = list(raw_data[carton_only_mask].index)
+    
+    choice_df = raw_data[choice_mask]
+    q.put(("log", f"发现 {len(choice_df)} 种SKU可选择存储模式，开始评估...\n"))
+    
+    for index, sku in choice_df.iterrows():
+        utilization = calculate_pallet_utilization(sku, pallet_params)
+        if utilization >= pallet_params['min_util_threshold']:
+            skus_for_pallet_indices.append(index)
+        else:
+            skus_for_carton_indices.append(index)
+            
+    skus_for_pallets = raw_data.loc[skus_for_pallet_indices].copy()
+    skus_for_shelves = raw_data.loc[skus_for_carton_indices].copy()
+    
+    q.put(("log", f"决策完成: {len(skus_for_pallets)} 种SKU分配至托盘, {len(skus_for_shelves)} 种SKU分配至货架。\n"))
+    return skus_for_pallets, skus_for_shelves
+
+def calculate_pallet_requirements(skus_for_pallets, pallet_params):
+    """
+    v1.0.0: 计算托盘路径下的总托盘需求。
+    """
+    if skus_for_pallets.empty:
+        return 0, "无SKU被分配至托盘存储。"
+    total_pallets = 0
+    for _, sku in skus_for_pallets.iterrows():
+        try:
+            pallet_l, pallet_d, pallet_h = pallet_params['L'], pallet_params['D'], pallet_params['H']
+            n1 = math.floor(pallet_l / sku['L']) * math.floor(pallet_d / sku['D'])
+            n2 = math.floor(pallet_l / sku['D']) * math.floor(pallet_d / sku['L'])
+            n_per_layer = max(n1, n2)
+            if n_per_layer == 0: continue
+            num_layers = math.floor(pallet_h / sku['H'])
+            if num_layers == 0: continue
+            skus_per_pallet = n_per_layer * num_layers
+            pallets_needed = math.ceil(sku['qty'] / skus_per_pallet)
+            total_pallets += pallets_needed
+        except (ValueError, TypeError, ZeroDivisionError):
+            continue
+    report = f"总计需要 {total_pallets} 个标准托盘位来存储 {len(skus_for_pallets)} 种SKU。"
+    return total_pallets, report
+
+# --- v3.6 继承函数 ---
+
+def is_complementary(shelf1, shelf2, area_threshold, size_threshold):
+    area1 = shelf1['Lp'] * shelf1['Dp']; area2 = shelf2['Lp'] * shelf2['Dp']
+    if max(area1, area2) == 0: return False
+    area_ratio = min(area1, area2) / max(area1, area2)
+    if area_ratio > area_threshold: return False
+    if max(shelf1['Lp'], shelf2['Lp']) == 0 or max(shelf1['Dp'], shelf2['Dp']) == 0: return False
+    length_ratio = min(shelf1['Lp'], shelf2['Lp']) / max(shelf1['Lp'], shelf2['Lp'])
+    depth_ratio = min(shelf1['Dp'], shelf2['Dp']) / max(shelf1['Dp'], shelf2['Dp'])
+    if length_ratio > size_threshold and depth_ratio > size_threshold: return False
+    return True
+
+def pre_filter_combinations(shelves, area_threshold, size_threshold):
+    valid_combinations = []
+    for i, shelf1 in enumerate(shelves):
+        for j, shelf2 in enumerate(shelves[i+1:], i+1):
+            if is_complementary(shelf1, shelf2, area_threshold, size_threshold):
+                valid_combinations.append((shelf1, shelf2))
+    return valid_combinations
+
+def evaluate_shelf_combination(agg_data, two_shelves, coverage_target, allow_rotation):
+    assignments = {0: [], 1: []}
+    for _, sku_group in agg_data.iterrows():
+        best_fit, best_efficiency = None, -1
+        for i, shelf in enumerate(two_shelves):
+            if sku_group['W'] > shelf['Wp']: continue
+            orientations = [{'w': sku_group['L'], 'd': sku_group['D']}]
+            if allow_rotation and sku_group['L'] != sku_group['D']:
+                orientations.append({'w': sku_group['D'], 'd': sku_group['L']})
+            for ori in orientations:
+                w, d = ori['w'], ori['d']
+                if w <= shelf['Lp'] and d <= shelf['Dp'] and shelf['Lp'] > 0 and shelf['Dp'] > 0:
+                    space_utilization = (w * d) / (shelf['Lp'] * shelf['Dp'])
+                    if space_utilization > best_efficiency:
+                        best_efficiency = space_utilization
+                        best_fit = {'shelf_idx': i, 'width': w, 'sku_group': sku_group}
+        if best_fit:
+            item = (best_fit['sku_group'].to_dict(), best_fit['width'], int(best_fit['sku_group']['count']))
+            assignments[best_fit['shelf_idx']].append(item)
+    total_count = agg_data['count'].sum(); total_volume = (agg_data['V'] * agg_data['count']).sum()
+    placed_count = sum(item[2] for lst in assignments.values() for item in lst)
+    placed_volume = sum(item[0]['V'] * item[2] for lst in assignments.values() for item in lst)
+    coverage_count = placed_count / total_count if total_count > 0 else 0
+    coverage_volume = placed_volume / total_volume if total_volume > 0 else 0
+    if placed_count < total_count * coverage_target or placed_volume < total_volume * coverage_target:
+        return {'status': 'failure', 'coverage_count': coverage_count, 'coverage_volume': coverage_volume}
+    counts = [run_bulk_ffd_packing(assignments[i], two_shelves[i]['Lp']) for i in range(2)]
+    return {'status': 'success', 'counts': counts, 'coverage_count': coverage_count, 'coverage_volume': coverage_volume}
+
+def ld_calculator_complementary(agg_data, shelves, coverage_target, allow_rotation, q, params):
+    best_combo, min_total_shelves = None, float('inf')
+    best_attempt_combo, max_achieved_coverage = None, 0.0
+    q.put(("log", "--- 步骤 2a: 执行前置可行性检验 ---\n"))
+    area_threshold = params.get('area_threshold', 0.7)
+    size_threshold = params.get('size_threshold', 0.8)
+    valid_combinations = pre_filter_combinations(shelves, area_threshold, size_threshold)
+    if len(valid_combinations) == 0:
+        q.put(("log", "警告: 前置检验未找到任何互补组合，将评估所有组合，可能耗时较长。\n"))
+        valid_combinations = [(shelves[i], shelves[j]) for i in range(len(shelves)) for j in range(i+1, len(shelves))]
+    total_combinations = len(valid_combinations)
+    q.put(("log", f"前置检验完成，共需评估 {total_combinations} 种L&D组合。\n"))
+    start_time = time.time()
+    for i, (shelf1, shelf2) in enumerate(valid_combinations):
+        try:
+            two_shelves = [shelf1, shelf2]
+            solution = evaluate_shelf_combination(agg_data, two_shelves, coverage_target, allow_rotation)
+            if solution['coverage_count'] > max_achieved_coverage:
+                max_achieved_coverage = solution['coverage_count']
+                best_attempt_combo = (shelf1, shelf2)
+            if solution['status'] == 'success':
+                total_shelves = sum(solution['counts'])
+                if total_shelves < min_total_shelves:
+                    min_total_shelves = total_shelves
+                    best_combo = (shelf1, shelf2)
+        except Exception as e:
+            q.put(("log", f"警告: 评估组合 {shelf1['Lp']:.0f}x{shelf1['Dp']:.0f} + {shelf2['Lp']:.0f}x{shelf2['Dp']:.0f} 时出错: {str(e)}\n"))
+            continue
+        q.put(("progress", (i + 1, total_combinations, start_time, f"评估L&D组合 {i+1}/{total_combinations}")))
+    if best_combo: return ("success", best_combo)
+    else:
+        if best_attempt_combo:
+            q.put(("log", f"未找到满足覆盖率 {coverage_target*100:.1f}% 的组合。最佳尝试组合为 {best_attempt_combo[0]['Lp']:.0f}x{best_attempt_combo[0]['Dp']:.0f} 和 {best_attempt_combo[1]['Lp']:.0f}x{best_attempt_combo[1]['Dp']:.0f}，覆盖率为 {max_achieved_coverage*100:.1f}%。\n"))
+            return ("failure", best_attempt_combo, max_achieved_coverage)
+        else:
+            q.put(("log", "未找到任何可行的L&D组合。\n"))
+            return ("failure", None, 0.0)
+
+
+def main_calculation_with_grouping(data, shelves, pallet_decimal_threshold, coverage_target, 
+                                  allow_rotation, pallet_char, box_char, params, q):
+    """
+    重构后的主计算流程
+    
+    Args:
+        data: SKU数据
+        shelves: 货架数据
+        pallet_decimal_threshold: 装托判定阈值
+        coverage_target: 覆盖率目标
+        allow_rotation: 是否允许旋转
+        pallet_char: 装托货架标识
+        box_char: 装箱货架标识
+        params: 其他参数
+        q: 日志队列
+    
+    Returns:
+        dict: 完整的计算结果
+    """
     
     # 步骤1：装箱装托判定
-    packing_summary = analyze_packing_decision(data, params['pallet_decimal_threshold'], q)
+    packing_summary = analyze_packing_decision(data, pallet_decimal_threshold, q)
+    
     if not packing_summary['decisions']:
-        raise ValueError("装箱装托判定失败，无有效SKU数据。")
+        return {"error": "装箱装托判定失败，无有效SKU数据"}
     
     # 步骤2：数据分组
     grouped_data = split_data_by_packing_decision(data, packing_summary['decisions'], q)
@@ -352,45 +620,619 @@ def main_calculation_with_grouping(data, shelves, coverage_target, allow_rotatio
     # 步骤3：货架分组
     grouped_shelves = split_shelves_by_type(shelves, pallet_char, box_char, q)
     
+    # 检查是否有可用的货架和数据组合
+    has_workable_combination = False
+    if not grouped_data['box_only_data'].empty and grouped_shelves['box_shelves']:
+        has_workable_combination = True
+    if not grouped_data['pallet_only_data'].empty and grouped_shelves['pallet_shelves']:
+        has_workable_combination = True
+    if not grouped_data['mixed_data'].empty and (grouped_shelves['pallet_shelves'] or grouped_shelves['box_shelves']):
+        has_workable_combination = True
+    
+    if not has_workable_combination:
+        return {"error": "无可用的数据和货架组合进行计算"}
+    
     # 步骤4：分组独立计算
-    grouped_results = process_grouped_calculations(grouped_data, grouped_shelves, coverage_target, allow_rotation, q, params)
+    calculation_results = process_grouped_calculations(
+        grouped_data, grouped_shelves, coverage_target, allow_rotation, params, q
+    )
     
-    # 步骤5：结果汇总与未安放诊断（顶层统一处理）
+    # 整合最终结果
+    final_result = {
+        'packing_summary': packing_summary,
+        'grouped_results': calculation_results,
+        'success_groups': [k for k, v in calculation_results.items() if v[0] == "success"],
+        'failed_groups': [k for k, v in calculation_results.items() if v[0] == "failure"],
+        'skipped_groups': [k for k, v in calculation_results.items() if v[0] == "skip"]
+    }
+    
+    # 收集所有未安放的SKU和详细原因
     all_placed_sku_ids = set()
-    for group_key, result in grouped_results.items():
-        status, _, solution = result
-        if status == "success" and solution and 'placed_sku_ids' in solution:
-            all_placed_sku_ids.update(solution['placed_sku_ids'])
-            
-    # 使用原始数据进行对比，找出未安放的
-    all_sku_ids = set(data['sku_id'].astype(str))
-    unplaced_sku_ids = all_sku_ids - all_placed_sku_ids
-    unplaced_skus_df = data[data['sku_id'].isin(unplaced_sku_ids)].copy()
-    
-    # 为未安放的SKU统一生成原因
-    # 需要一个包含所有成功推荐的货架的列表
-    all_recommended_shelves = []
-    for _, result in grouped_results.items():
-        if result[0] == 'success' and result[2] and 'final_shelves' in result[2]:
-            all_recommended_shelves.extend(result[2]['final_shelves'])
-    
-    # 去重
-    unique_shelves = [dict(t) for t in {tuple(d.items()) for d in all_recommended_shelves}]
-    
-    detailed_reasons = get_detailed_unplaced_reasons_by_sku_id(
-        unplaced_skus_df, unique_shelves, params['h_max'], allow_rotation
-    ) if not unplaced_skus_df.empty else {}
+    for group_name, result in calculation_results.items():
+        if result[0] == "success":
+            # result[2] 是 evaluate_shelf_combination 返回的 solution 字典
+            # solution 字典中包含 placed_sku_ids
+            all_placed_sku_ids.update(result[2]['placed_sku_ids'])
 
-    q.put(("log", "\n" + "="*25 + " 分组计算流程完成 " + "="*25 + "\n"))
+    unplaced_skus_df = data[~data['sku_id'].isin(all_placed_sku_ids)].copy()
+    detailed_reasons = get_detailed_unplaced_reasons_by_sku_id(
+        unplaced_skus_df, shelves, params['h_max'], allow_rotation
+    )
+
+    final_result['unplaced_skus'] = unplaced_skus_df
+    final_result['detailed_reasons'] = detailed_reasons
+
+    return final_result
+
+
+"""
+========== 后续代码需要修改的部分 ==========
+
+1. 主调用函数需要修改：
+   - 将原来的单一计算流程替换为 main_calculation_with_grouping()
+   - 需要传入 pallet_char 和 box_char 参数
+   - 需要处理分组结果的展示和汇总
+
+2. 结果展示函数需要修改：
+   - 原来显示单一结果，现在需要显示三个分组的结果
+   - 需要添加分组统计信息的展示
+   - 可能需要提供"最优结果选择"功能（从三个分组中选择最好的）
+
+3. 相关性分析函数需要修改：
+   - correlation_analysis() 函数可能需要分别对三个分组进行分析
+   - 或者在分组前进行一次整体分析
+
+4. 配置文件/参数传递需要修改：
+   - 需要添加 pallet_char 和 box_char 的配置
+   - 可能需要为不同分组设置不同的参数
+
+5. aggregate_sku_data() 函数需要实现：
+   - 这个函数在当前代码中只是伪代码
+   - 需要根据原有的数据聚合逻辑来实现
+   - 可能需要处理不同分组的特殊聚合需求
+
+6. 错误处理和日志记录需要增强：
+   - 需要处理某个分组失败但其他分组成功的情况
+   - 需要提供更详细的分组级别的错误信息
+
+7. 如果有GUI界面，需要修改：
+   - 参数设置界面需要添加货架类型标识的配置
+   - 结果显示界面需要支持分组结果的展示
+   - 可能需要添加分组计算的进度显示
+
+8. 导出功能需要修改：
+   - 结果导出需要包含三个分组的详细信息
+   - 可能需要分别导出每个分组的结果
+
+9. 测试和验证代码需要修改：
+   - 需要创建包含不同装箱类型的测试数据
+   - 需要验证分组逻辑的正确性
+   - 需要测试各种边界情况（某个分组为空等）
+
+10. 文档和注释需要更新：
+    - API文档需要反映新的函数签名和返回值结构
+    - 用户手册需要说明新的分组计算逻辑
+"""
+
+def aggregate_skus_by_shelf_type(data, packing_decisions, shelf_type, num_bins):
+    """
+    根据货架类型和装箱装托决策进行数据聚合
+    
+    参数:
+    - data: SKU数据
+    - packing_decisions: 装箱装托决策结果
+    - shelf_type: 货架类型 ('pallet' 或 'box')
+    - num_bins: 聚合分箱数量
+    """
+    if data.empty:
+        return pd.DataFrame()
+    
+    # 筛选出需要使用对应货架类型的SKU
+    relevant_skus = []
+    for sku_id, decision in packing_decisions.items():
+        decision_type = decision['decision']
+        if shelf_type == 'pallet' and decision_type in ['pallet_only', 'mixed']:
+            relevant_skus.append(sku_id)
+        elif shelf_type == 'box' and decision_type in ['box_only', 'mixed']:
+            relevant_skus.append(sku_id)
+    
+    # 筛选数据
+    filtered_data = data[data['sku_id'].isin(relevant_skus)].copy()
+    if filtered_data.empty:
+        return pd.DataFrame()
+    
+    # 根据货架类型选择对应的LDHWV数据
+    if shelf_type == 'pallet':
+        # 使用装托LDHWV数据
+        filtered_data['L'] = filtered_data['pallet_l']
+        filtered_data['D'] = filtered_data['pallet_d']
+        filtered_data['H'] = filtered_data['pallet_h']
+        filtered_data['W'] = filtered_data['pallet_w']
+        filtered_data['V'] = filtered_data['pallet_v']
+    else:
+        # 使用装箱LDHWV数据
+        filtered_data['L'] = filtered_data['box_l']
+        filtered_data['D'] = filtered_data['box_d']
+        filtered_data['H'] = filtered_data['box_h']
+        filtered_data['W'] = filtered_data['box_w']
+        filtered_data['V'] = filtered_data['box_v']
+    
+    # 进行聚合
+    filtered_data['l_bin'] = pd.cut(filtered_data['L'], bins=num_bins, labels=False, duplicates='drop')
+    filtered_data['d_bin'] = pd.cut(filtered_data['D'], bins=num_bins, labels=False, duplicates='drop')
+    agg_data = filtered_data.groupby(['l_bin', 'd_bin']).agg(
+        L=('L', 'median'), 
+        D=('D', 'median'), 
+        H=('H', 'median'), 
+        W=('W', 'median'), 
+        V=('V', 'median'), 
+        count=('L', 'size'), 
+        sku_ids=('sku_id', lambda x: list(x))
+    ).reset_index()
+    
+    return agg_data
+
+def aggregate_skus(data, num_bins):
+    """保留原始聚合函数以保持向后兼容性"""
+    if not data.empty:
+        # 使用默认的LDHWV数据（装托数据）
+        if 'pallet_l' in data.columns:
+            data = data.copy()
+            data['L'] = data['pallet_l']
+            data['D'] = data['pallet_d']
+            data['H'] = data['pallet_h']
+            data['W'] = data['pallet_w']
+            data['V'] = data['pallet_v']
+        
+        data['l_bin'] = pd.cut(data['L'], bins=num_bins, labels=False, duplicates='drop')
+        data['d_bin'] = pd.cut(data['D'], bins=num_bins, labels=False, duplicates='drop')
+        agg_data = data.groupby(['l_bin', 'd_bin']).agg(L=('L', 'median'), D=('D', 'median'), H=('H', 'median'), W=('W', 'median'), V=('V', 'median'), count=('L', 'size'), sku_ids=('sku_id', lambda x: list(x))).reset_index()
+        return agg_data
+    return pd.DataFrame()
+
+def get_fittable_skus_for_shelf(agg_data, shelf, allow_rotation):
+    fittable_skus = []
+    for _, sku_group in agg_data.iterrows():
+        l, d, w = sku_group['L'], sku_group['D'], sku_group['W']
+        if w > shelf['Wp']: continue
+        fit_width = -1
+        if l <= shelf['Lp'] and d <= shelf['Dp']: fit_width = l
+        if allow_rotation and d <= shelf['Lp'] and l <= shelf['Dp']: fit_width = min(l, d) if fit_width != -1 else d
+        if fit_width != -1: fittable_skus.append((sku_group.to_dict(), fit_width, int(sku_group['count'])))
+    return fittable_skus
+
+def ld_calculator_single(agg_data, shelves, coverage_target, allow_rotation, q):
+    best_shelf, min_shelf_count = None, float('inf')
+    total_sku_count = agg_data['count'].sum(); total_sku_volume = (agg_data['V'] * agg_data['count']).sum()
+    target_count = total_sku_count * coverage_target; target_volume = total_sku_volume * coverage_target
+    best_attempt_shelf, max_achieved_count_coverage, max_achieved_volume_coverage = None, 0.0, 0.0
+    total_shelves_to_eval = len(shelves); start_time = time.time()
+    for i, shelf in enumerate(shelves):
+        fittable_skus = get_fittable_skus_for_shelf(agg_data, shelf, allow_rotation)
+        placed_count = sum(item[2] for item in fittable_skus)
+        placed_volume = sum(item[0]['V'] * item[2] for item in fittable_skus)
+        current_count_coverage = placed_count / total_sku_count if total_sku_count > 0 else 0
+        if current_count_coverage > max_achieved_count_coverage:
+            max_achieved_count_coverage = current_count_coverage
+            max_achieved_volume_coverage = placed_volume / total_sku_volume if total_sku_volume > 0 else 0
+            best_attempt_shelf = shelf
+        if total_sku_count == 0 or placed_count < target_count or placed_volume < target_volume:
+            q.put(("progress", (i + 1, total_shelves_to_eval, start_time, f"评估L&D规格 {i+1}/{total_shelves_to_eval} (跳过)")))
+            continue
+        shelf_count = run_bulk_ffd_packing(fittable_skus, shelf['Lp'])
+        if shelf_count < min_shelf_count:
+            min_shelf_count, best_shelf = shelf_count, shelf
+        q.put(("progress", (i + 1, total_shelves_to_eval, start_time, f"评估L&D规格 {i+1}/{total_shelves_to_eval}")))
+    if best_shelf: return ("success", (best_shelf, best_attempt_shelf, max_achieved_count_coverage))
+    else: return ("failure", {"shelf": best_attempt_shelf, "count_coverage": max_achieved_count_coverage, "volume_coverage": max_achieved_volume_coverage})
+
+def calculate_three_dimensional_score(solution, params):
+    if solution['status'] != 'success': return 0.0, {'count_util': 0.0, 'volume_util': 0.0, 'height_util': 0.0}
+    count_utilization = solution.get('coverage_count', 0); volume_utilization = solution.get('coverage_volume', 0)
+    warehouse_h = params.get('warehouse_h', 6000); bottom_clearance = params.get('bottom_clearance', 150)
+    layer_headroom = params.get('layer_headroom', 100); shelf_thickness = params.get('shelf_thickness', 50)
+    usable_vertical_space = warehouse_h - bottom_clearance
+    height_utilization = 0.0
+    if solution.get('assignments'):
+        final_shelves = solution.get('final_shelves', []); assignments = solution.get('assignments', {})
+        shelf_counts = solution.get('counts', []); total_weighted_utilization = 0; total_shelf_units = sum(shelf_counts)
+        if total_shelf_units > 0:
+            for i, shelf in enumerate(final_shelves):
+                shelf_h = shelf['H']; single_layer_total_height = shelf_h + shelf_thickness + layer_headroom; num_layers = 0
+                if single_layer_total_height > 0 and usable_vertical_space > 0: num_layers = math.floor(usable_vertical_space / single_layer_total_height)
+                items_on_this_shelf = assignments.get(i, [])
+                total_sku_h_on_shelf = sum(item[0]['H'] * item[2] for item in items_on_this_shelf)
+                total_sku_count_on_shelf = sum(item[2] for item in items_on_this_shelf)
+                avg_sku_h = total_sku_h_on_shelf / total_sku_count_on_shelf if total_sku_count_on_shelf > 0 else 0
+                utilization_for_this_spec = (num_layers * avg_sku_h) / warehouse_h if warehouse_h > 0 else 0
+                total_weighted_utilization += utilization_for_this_spec * shelf_counts[i]
+            height_utilization = total_weighted_utilization / total_shelf_units
+    count_weight = params.get('count_weight', 0.25); volume_weight = params.get('volume_weight', 0.25); height_weight = params.get('height_weight', 0.5)
+    total_score = (count_weight * count_utilization + volume_weight * volume_utilization + height_weight * height_utilization)
+    metrics = {'count_util': count_utilization, 'volume_util': volume_utilization, 'height_util': height_utilization}
+    return total_score, metrics
+
+def h_calculator_three_dimensional(agg_data, operable_data, best_ld_shelf, coverage_target, allow_rotation, params, q):
+    q.put(("log", "--- 步骤 3a: 正在生成智能候选高度组合 ---\n")); h_max = params['h_max']
+    min_height = operable_data['H'].min(); max_height = operable_data['H'].max()
+    percentiles = [10, 25, 40, 50, 60, 75, 85, 90, 95]
+    candidate_heights = [round(h) for p in percentiles if min_height <= (h := np.percentile(operable_data['H'], p)) <= h_max]
+    height_step = params.get('height_step', 50); boundary_heights = np.arange(min_height, h_max + height_step, height_step)
+    all_candidates = sorted(list(set(candidate_heights + list(boundary_heights))))
+    q.put(("log", f"基于SKU高度分布，生成了 {len(all_candidates)} 个候选高度点。\n")); min_height_diff = params.get('min_height_diff', 150)
+    height_coverage = {h: len(operable_data[operable_data['H'] <= h]) for h in all_candidates}
+    min_coverage_ratio = 0.3
+    meaningful_heights = [h for h in all_candidates if (height_coverage[h] / len(operable_data) if len(operable_data) > 0 else 0) >= min_coverage_ratio]
+    q.put(("log", f"预筛选后，保留了 {len(meaningful_heights)} 个有意义的高度点。\n")); height_combinations = list(combinations(meaningful_heights, 2))
+    filtered_combinations = [(h1, h2) for h1, h2 in height_combinations if abs(h2 - h1) >= min_height_diff]; final_combinations = []
+    if len(operable_data) > 0:
+        for h1, h2 in filtered_combinations:
+            coverage1 = height_coverage.get(h1, 0) / len(operable_data); coverage2 = height_coverage.get(h2, 0) / len(operable_data)
+            if (coverage1 >= 0.5 or coverage2 >= 0.5) and abs(coverage2 - coverage1) >= 0.1: final_combinations.append(tuple(sorted((h1, h2))))
+    final_combinations = sorted(list(set(final_combinations))); max_combinations = 75
+    if len(final_combinations) > max_combinations:
+        q.put(("log", f"候选组合过多({len(final_combinations)}), 将智能筛选评分最高的 {max_combinations} 种组合进行评估。\n")); final_combinations = final_combinations[:max_combinations]
+    if not final_combinations:
+        final_combinations = filtered_combinations[:max_combinations]
+        if final_combinations: q.put(("log", "警告: 未找到满足智能筛选条件的组合，使用备选方案进行评估。\n"))
+    if not final_combinations: raise ValueError("未能找到任何可评估的高度组合。\n\n【建议】\n1. 尝试放宽'最小高度差值'参数。\n2. 检查SKU数据的高度分布是否过于集中。")
+    q.put(("log", f"最终筛选出 {len(final_combinations)} 种高度组合进入模拟评估阶段。\n--- 步骤 3b: 正在执行完整方案模拟评估 ---\n")); evaluation_details = []
+    min_count_utilization = params.get('min_count_utilization', 0.8); total_combos, start_time = len(final_combinations), time.time()
+    for i, (h1, h2) in enumerate(final_combinations):
+        ld_specs = best_ld_shelf if isinstance(best_ld_shelf, (list, tuple)) else (best_ld_shelf, best_ld_shelf)
+
+        if params['ld_method'] == 'complementary':
+            ld1, ld2 = ld_specs[0], ld_specs[1]
+            shelves_to_evaluate = [
+                {'Lp': ld1['Lp'], 'Dp': ld1['Dp'], 'Wp': ld1['Wp'], 'H': h1},
+                {'Lp': ld1['Lp'], 'Dp': ld1['Dp'], 'Wp': ld1['Wp'], 'H': h2},
+                {'Lp': ld2['Lp'], 'Dp': ld2['Dp'], 'Wp': ld2['Wp'], 'H': h1},
+                {'Lp': ld2['Lp'], 'Dp': ld2['Dp'], 'Wp': ld2['Wp'], 'H': h2},
+            ]
+        else:
+            ld = ld_specs[0]
+            shelves_to_evaluate = [
+                {'Lp': ld['Lp'], 'Dp': ld['Dp'], 'Wp': ld['Wp'], 'H': h1},
+                {'Lp': ld['Lp'], 'Dp': ld['Dp'], 'Wp': ld['Wp'], 'H': h2}
+            ]
+
+        solution = final_allocation_and_counting(agg_data, shelves_to_evaluate, coverage_target, allow_rotation)
+        score, metrics = calculate_three_dimensional_score(solution, params)
+        status_is_success = solution['status'] == 'success' and metrics['count_util'] >= min_count_utilization
+        evaluation_details.append({"h1": h1, "h2": h2, "score": score, "metrics": metrics, "is_feasible": status_is_success, "solution": solution})
+        q.put(("progress", (i + 1, total_combos, start_time, f"评估高度组合 {i+1}/{total_combos}")))
+    if not evaluation_details: raise ValueError("在所有候选评估中均未能找到任何有效的高度组合方案。")
+    feasible_solutions = [d for d in evaluation_details if d['is_feasible']]
+    if feasible_solutions: best_solution_detail = max(feasible_solutions, key=lambda x: x['score'])
+    else: q.put(("log", f"提示: 未找到满足最低数量利用率({min_count_utilization*100:.1f}%)的方案，将返回综合得分最高的方案。\n")); best_solution_detail = max(evaluation_details, key=lambda x: x['score'])
+    best_combo = (best_solution_detail['h1'], best_solution_detail['h2'])
+    q.put(("log", f"\n--- 步骤 3 完成：最优高度组合已确定 ---\n")); return sorted(list(best_combo)), evaluation_details
+
+def h_calculator_coverage_driven(data, h_max, p1, p2):
+    h1 = np.percentile(data['H'], p1); h2 = np.percentile(data['H'], p2); h1, h2 = min(h1, h_max), min(h2, h_max); return sorted(list(set([round(h1), round(h2)]))), []
+
+def calculate_boundary_effects(data, h_max, step_size, volume_weight, q):
+    heights = np.arange(data['H'].min(), h_max + step_size, step_size); results = []; last_count, last_volume = 0, 0
+    total_steps, start_time = len(heights), time.time()
+    for i, h in enumerate(heights):
+        covered_data = data[data['H'] <= h]; current_count, current_volume = len(covered_data), covered_data['V'].sum()
+        delta_count, delta_volume = current_count - last_count, current_volume - last_volume
+        norm_delta_count = delta_count / len(data) if len(data) > 0 else 0
+        norm_delta_volume = delta_volume / data['V'].sum() if data['V'].sum() > 0 else 0
+        effect = (1 - volume_weight) * norm_delta_count + volume_weight * norm_delta_volume
+        results.append({'h': h, 'effect': effect}); last_count, last_volume = current_count, current_volume
+        if i % 10 == 0: q.put(("progress", (i + 1, total_steps, start_time, f"计算边界效应中 {i+1}/{total_steps}")))
+    return pd.DataFrame(results)
+
+def identify_candidate_heights(boundary_effects, min_diff, num_candidates=15):
+    top_effects = boundary_effects.nlargest(num_candidates * 3, 'effect'); candidates = []
+    for _, row in top_effects.iterrows():
+        h = row['h']
+        if all(abs(h - ch) >= min_diff for ch in candidates): candidates.append(h)
+        if len(candidates) >= num_candidates: break
+    return sorted(candidates)
+
+def h_calculator_boundary_driven(agg_data, operable_data, best_ld_shelf, h_max, coverage_target, allow_rotation, params, q, best_theoretical_ld, best_theoretical_coverage):
+    q.put(("log", "--- 步骤 3a: 正在计算高度边界效应 ---\n")); effects_df = calculate_boundary_effects(operable_data, h_max, params['height_step'], params['volume_weight'], q)
+    q.put(("log", "--- 步骤 3b: 正在筛选候选高度点 ---\n")); candidate_heights = identify_candidate_heights(effects_df, params['min_height_diff'])
+    if len(candidate_heights) < 2: raise ValueError(f"未能找到满足最小差值({params['min_height_diff']}mm)的候选高度。\n\n【建议】\n请尝试在左侧配置中减小'最小高度差值'参数的值再试。")
+    q.put(("log", f"发现 {len(candidate_heights)} 个候选高度点: {[f'{h:.0f}' for h in candidate_heights]}\n")); height_combinations = list(combinations(candidate_heights, 2))
+    q.put(("log", f"--- 步骤 3c: 正在评估 {len(height_combinations)} 种高度组合 ---\n"))
+    best_combo, min_total_shelves = None, float('inf'); best_attempt_combo, max_coverage_in_h_step = None, 0.0; total_combos, start_time = len(height_combinations), time.time()
+    for i, (h1, h2) in enumerate(height_combinations):
+        ld_specs = best_ld_shelf if isinstance(best_ld_shelf, (list, tuple)) else (best_ld_shelf, best_ld_shelf)
+
+        if params['ld_method'] == 'complementary':
+            ld1, ld2 = ld_specs[0], ld_specs[1]
+            shelves_to_evaluate = [
+                {'Lp': ld1['Lp'], 'Dp': ld1['Dp'], 'Wp': ld1['Wp'], 'H': h1},
+                {'Lp': ld1['Lp'], 'Dp': ld1['Dp'], 'Wp': ld1['Wp'], 'H': h2},
+                {'Lp': ld2['Lp'], 'Dp': ld2['Dp'], 'Wp': ld2['Wp'], 'H': h1},
+                {'Lp': ld2['Lp'], 'Dp': ld2['Dp'], 'Wp': ld2['Wp'], 'H': h2},
+            ]
+        else:
+            ld = ld_specs[0]
+            shelves_to_evaluate = [
+                {'Lp': ld['Lp'], 'Dp': ld['Dp'], 'Wp': ld['Wp'], 'H': h1},
+                {'Lp': ld['Lp'], 'Dp': ld['Dp'], 'Wp': ld['Wp'], 'H': h2}
+            ]
+
+        solution = final_allocation_and_counting(agg_data, shelves_to_evaluate, coverage_target, allow_rotation)
+        if solution['coverage_count'] > max_coverage_in_h_step: max_coverage_in_h_step, best_attempt_combo = solution['coverage_count'], (h1, h2)
+        if solution['status'] == 'success' and sum(solution['counts']) < min_total_shelves: min_total_shelves, best_combo = sum(solution['counts']), (h1, h2)
+        q.put(("progress", (i + 1, total_combos, start_time, f"评估高度组合 {i+1}/{total_combos}")))
+    if best_combo is None:
+        if best_attempt_combo is None: raise ValueError("在评估高度组合时发生未知错误，未能找到任何有效的组合。")
+        h1_best, h2_best = sorted(list(best_attempt_combo))
+        raise ValueError(f"计算失败：未能找到满足覆盖率目标 ({coverage_target*100:.1f}%) 的高度组合。最高覆盖率 {max_coverage_in_h_step*100:.2f}% (在 {h1_best:.0f}mm 和 {h2_best:.0f}mm 时取得)")
+    q.put(("log", "\n--- 步骤 3 完成：最优高度组合已确定 ---\n")); return sorted(list(best_combo)), []
+
+def final_placement_with_individual_skus_mixed(operable_data, final_shelves, packing_decisions, allow_rotation, q):
+    """
+    混合模式最终精确装箱与统计函数
+    - 根据货架类型和SKU的装箱装托决策使用相应的LDHWV数据
+    - 分配SKU时遵循"三维体积利用率最高"原则
+    - 精确计算货架需求数量
+    """
+    q.put(("log", "开始基于混合装箱装托模式进行精确分配与装箱...\n"))
+    num_shelf_types = len(final_shelves)
+    # assignments的结构：{shelf_idx: [(sku_dict, placed_width), ...]}
+    assignments = {i: [] for i in range(num_shelf_types)}
+    sku_shelf_assignments = {}
+
+    total_skus = len(operable_data)
+    start_time = time.time()
+    
+    # 1. 逐一分配真实SKU
+    for idx, sku in operable_data.iterrows():
+        sku_id = sku['sku_id']
+        
+        # 检查这个SKU是否有有效的装箱装托决策
+        if sku_id not in packing_decisions:
+            continue
+            
+        decision = packing_decisions[sku_id]['decision']
+        possible_fits = []
+
+        for i, shelf in enumerate(final_shelves):
+            shelf_data_type = shelf.get('data_type', 'pallet')  # 默认使用装托数据
+            
+            # 根据装箱装托决策和货架类型选择适当的LDHWV数据
+            use_this_shelf = False
+            if decision == 'box_only' and shelf_data_type == 'box':
+                use_this_shelf = True
+            elif decision == 'pallet_only' and shelf_data_type == 'pallet':
+                use_this_shelf = True
+            elif decision == 'mixed':
+                # 混装SKU可以使用任何类型的货架
+                use_this_shelf = True
+            
+            if not use_this_shelf:
+                continue
+            
+            # 根据货架数据类型选择对应的SKU尺寸数据
+            if shelf_data_type == 'pallet':
+                sku_l, sku_d, sku_h, sku_w, sku_v = sku['pallet_l'], sku['pallet_d'], sku['pallet_h'], sku['pallet_w'], sku['pallet_v']
+            else:
+                sku_l, sku_d, sku_h, sku_w, sku_v = sku['box_l'], sku['box_d'], sku['box_h'], sku['box_w'], sku['box_v']
+            
+            if sku_w > shelf['Wp'] or sku_h > shelf['H']:
+                continue
+            
+            orientations = [{'w': sku_l, 'd': sku_d}]
+            if allow_rotation and sku_l != sku_d:
+                orientations.append({'w': sku_d, 'd': sku_l})
+            
+            for ori in orientations:
+                w, d = ori['w'], ori['d']
+                if w <= shelf['Lp'] and d <= shelf['Dp']:
+                    vol_util = 0
+                    if shelf['Lp'] > 0 and shelf['Dp'] > 0 and shelf['H'] > 0:
+                        vol_util = (w * d * sku_h) / (shelf['Lp'] * shelf['Dp'] * shelf['H'])
+                    possible_fits.append({'shelf_idx': i, 'width': w, 'vol_util': vol_util, 'data_type': shelf_data_type})
+        
+        if possible_fits:
+            best_fit = max(possible_fits, key=lambda x: x['vol_util'])
+            # 创建增强的SKU字典，包含使用的数据类型信息
+            enhanced_sku_dict = sku.to_dict()
+            enhanced_sku_dict['used_data_type'] = best_fit['data_type']
+            assignments[best_fit['shelf_idx']].append((enhanced_sku_dict, best_fit['width']))
+            sku_shelf_assignments[sku_id] = best_fit['shelf_idx']
+
+        if idx > 0 and idx % 200 == 0: # 更新进度
+            q.put(("progress", (idx + 1, total_skus, start_time, f"精确分配SKU {idx+1}/{total_skus}")))
+
+    q.put(("log", "所有真实SKU分配完成，正在精确计算货架数...\n"))
+
+    # 2. 精确计算货架数
+    final_counts = []
+    for i, shelf in enumerate(final_shelves):
+        items_on_shelf = assignments.get(i, [])
+        if not items_on_shelf:
+            final_counts.append(0)
+            continue
+        
+        packing_groups = []
+        sorted_items = sorted(items_on_shelf, key=lambda x: x[1])
+        for width, group in groupby(sorted_items, key=lambda x: x[1]):
+            count = sum(1 for _ in group)
+            packing_groups.append(({'placeholder': True}, width, count))
+            
+        shelf_count = run_bulk_ffd_packing(packing_groups, shelf['Lp'])
+        final_counts.append(shelf_count)
+
+    # 3. 产出最终结果
+    placed_sku_ids = set(sku_shelf_assignments.keys())
+    # 计算覆盖率时使用合适的体积数据
+    total_volume = 0
+    placed_volume = 0
+    
+    for _, sku in operable_data.iterrows():
+        sku_id = sku['sku_id']
+        if sku_id in packing_decisions:
+            decision = packing_decisions[sku_id]['decision']
+            # 根据决策类型选择体积计算方式
+            if decision == 'box_only':
+                vol = sku['box_v']
+            elif decision == 'pallet_only':
+                vol = sku['pallet_v']
+            else:  # mixed
+                vol = max(sku['pallet_v'], sku['box_v'])  # 使用较大的体积作为参考
+            
+            total_volume += vol
+            if sku_id in placed_sku_ids:
+                placed_volume += vol
+    
+    coverage_count = len(placed_sku_ids) / total_skus if total_skus > 0 else 0
+    coverage_volume = placed_volume / total_volume if total_volume > 0 else 0
     
     return {
-        "packing_summary": packing_summary,
-        "grouped_results": grouped_results,
-        "unplaced_skus": unplaced_skus_df,
-        "detailed_reasons": detailed_reasons
+        'status': 'success',
+        'counts': final_counts,
+        'coverage_count': coverage_count,
+        'coverage_volume': coverage_volume,
+        'placed_sku_ids': placed_sku_ids,
+        'sku_shelf_assignments': sku_shelf_assignments,
+        'assignments': assignments, 
+        'final_shelves': final_shelves
     }
 
-# --- 其他辅助函数 ---
+def final_placement_with_individual_skus(operable_data, final_shelves, allow_rotation, q):
+    """
+    v3.6.2 (已修正): 最终精确装箱与统计函数
+    - 使用未经聚合的`operable_data`进行计算，确保结果精确。
+    - 分配SKU时遵循"三维体积利用率最高"原则。
+    - 精确计算货架需求数量。
+    """
+    q.put(("log", "开始基于真实SKU数据进行精确分配与装箱...\n"))
+    num_shelf_types = len(final_shelves)
+    # assignments的结构：{shelf_idx: [(sku_dict, placed_width), ...]}
+    assignments = {i: [] for i in range(num_shelf_types)}
+    sku_shelf_assignments = {}
+
+    total_skus = len(operable_data)
+    start_time = time.time()
+    
+    # 1. 逐一分配真实SKU
+    for idx, sku in operable_data.iterrows():
+        possible_fits = []
+        # 使用装托数据作为默认（向后兼容）
+        sku_l = sku.get('pallet_l', sku.get('L', 0))
+        sku_d = sku.get('pallet_d', sku.get('D', 0))
+        sku_h = sku.get('pallet_h', sku.get('H', 0))
+        sku_w = sku.get('pallet_w', sku.get('W', 0))
+        
+        orientations = [{'w': sku_l, 'd': sku_d}]
+        if allow_rotation and sku_l != sku_d:
+            orientations.append({'w': sku_d, 'd': sku_l})
+
+        for i, shelf in enumerate(final_shelves):
+            if sku_w > shelf['Wp'] or sku_h > shelf['H']:
+                continue
+            
+            for ori in orientations:
+                w, d = ori['w'], ori['d']
+                if w <= shelf['Lp'] and d <= shelf['Dp']:
+                    vol_util = 0
+                    if shelf['Lp'] > 0 and shelf['Dp'] > 0 and shelf['H'] > 0:
+                        vol_util = (w * d * sku_h) / (shelf['Lp'] * shelf['Dp'] * shelf['H'])
+                    possible_fits.append({'shelf_idx': i, 'width': w, 'vol_util': vol_util})
+        
+        if possible_fits:
+            best_fit = max(possible_fits, key=lambda x: x['vol_util'])
+            assignments[best_fit['shelf_idx']].append((sku.to_dict(), best_fit['width']))
+            sku_shelf_assignments[sku['sku_id']] = best_fit['shelf_idx']
+
+        if idx > 0 and idx % 200 == 0: # 更新进度
+            q.put(("progress", (idx + 1, total_skus, start_time, f"精确分配SKU {idx+1}/{total_skus}")))
+
+    q.put(("log", "所有真实SKU分配完成，正在精确计算货架数...\n"))
+
+    # 2. 精确计算货架数
+    final_counts = []
+    for i, shelf in enumerate(final_shelves):
+        items_on_shelf = assignments.get(i, [])
+        if not items_on_shelf:
+            final_counts.append(0)
+            continue
+        
+        packing_groups = []
+        sorted_items = sorted(items_on_shelf, key=lambda x: x[1])
+        for width, group in groupby(sorted_items, key=lambda x: x[1]):
+            count = sum(1 for _ in group)
+            packing_groups.append(({'placeholder': True}, width, count))
+            
+        shelf_count = run_bulk_ffd_packing(packing_groups, shelf['Lp'])
+        final_counts.append(shelf_count)
+
+    # 3. 产出最终结果
+    placed_sku_ids = set(sku_shelf_assignments.keys())
+    placed_skus_df = operable_data[operable_data['sku_id'].isin(placed_sku_ids)]
+    
+    coverage_count = len(placed_sku_ids) / total_skus if total_skus > 0 else 0
+    
+    # 计算体积覆盖率时使用适当的体积数据
+    total_volume = operable_data.get('pallet_v', operable_data.get('V', pd.Series([0]))).sum()
+    placed_volume = placed_skus_df.get('pallet_v', placed_skus_df.get('V', pd.Series([0]))).sum()
+    coverage_volume = placed_volume / total_volume if total_volume > 0 else 0
+    
+    # 关键修正：不再执行二次聚合，直接返回最精确的assignments
+    return {
+        'status': 'success',
+        'counts': final_counts,
+        'coverage_count': coverage_count,
+        'coverage_volume': coverage_volume,
+        'placed_sku_ids': placed_sku_ids,
+        'sku_shelf_assignments': sku_shelf_assignments,
+        'assignments': assignments, 
+        'final_shelves': final_shelves
+    }
+
+def final_allocation_and_counting(agg_data, final_shelves, coverage_target, allow_rotation):
+    num_shelf_types = len(final_shelves)
+    assignments = {i: [] for i in range(num_shelf_types)}
+    sku_shelf_assignments = {}
+    for _, sku_group in agg_data.iterrows():
+        possible_fits = []
+        orientations = [{'w': sku_group['L'], 'd': sku_group['D']}]
+        if allow_rotation and sku_group['L'] != sku_group['D']: orientations.append({'w': sku_group['D'], 'd': sku_group['L']})
+        for i, shelf in enumerate(final_shelves):
+            if sku_group['W'] > shelf['Wp'] or sku_group['H'] > shelf['H']: continue
+            for ori in orientations:
+                w, d = ori['w'], ori['d']
+                if w <= shelf['Lp'] and d <= shelf['Dp']:
+                    rem_space = shelf['Lp'] * shelf['Dp'] - w * d
+                    possible_fits.append({'shelf_idx': i, 'width': w, 'rem_space': rem_space})
+        if not possible_fits: continue
+        best_fit = min(possible_fits, key=lambda x: x['rem_space'])
+        item_to_place = (sku_group.to_dict(), best_fit['width'], int(sku_group['count']))
+        assignments[best_fit['shelf_idx']].append(item_to_place)
+        for sku_id in sku_group['sku_ids']: sku_shelf_assignments[sku_id] = best_fit['shelf_idx']
+    total_sku_count = agg_data['count'].sum(); total_sku_volume = (agg_data['V'] * agg_data['count']).sum()
+    placed_count = sum(item[2] for lst in assignments.values() for item in lst)
+    placed_volume = sum(item[0]['V'] * item[2] for lst in assignments.values() for item in lst)
+    coverage_count = placed_count / total_sku_count if total_sku_count > 0 else 0
+    coverage_volume = placed_volume / total_sku_volume if total_sku_volume > 0 else 0
+    if total_sku_count == 0 or placed_count < total_sku_count * coverage_target or placed_volume < total_sku_volume * coverage_target:
+        return {'status': 'failure', 'counts': [0] * num_shelf_types, 'coverage_count': coverage_count, 'coverage_volume': coverage_volume, 'placed_sku_ids': set(), 'sku_shelf_assignments': {}, 'assignments': assignments, 'final_shelves': final_shelves}
+    final_counts = [run_bulk_ffd_packing(assignments[i], final_shelves[i]['Lp']) for i in range(num_shelf_types)]
+    placed_sku_ids = {sid for lst in assignments.values() for item in lst for sid in item[0]['sku_ids']}
+    return {'status': 'success', 'counts': final_counts, 'coverage_count': coverage_count, 'coverage_volume': coverage_volume, 'placed_sku_ids': placed_sku_ids, 'sku_shelf_assignments': sku_shelf_assignments, 'assignments': assignments, 'final_shelves': final_shelves}
+
+def calculate_fit_capacity(shelf_length, bin_state, item_width):
+    if item_width <= 0: return 0
+    count_on_shelf = bin_state['count']
+    if count_on_shelf == 0:
+        first_item_cost = item_width + 2 * SIDE_SPACING
+        if first_item_cost > shelf_length: return 0
+        item_cost = item_width + INTER_SPACING
+        return 1 + math.floor((shelf_length - first_item_cost) / item_cost) if item_cost > 0 else 1
+    else:
+        current_used_len = bin_state['sum_widths'] + (count_on_shelf - 1) * INTER_SPACING + 2 * SIDE_SPACING
+        item_cost = item_width + INTER_SPACING
+        if item_cost <= 0 or (shelf_length - current_used_len) < item_cost: return 0
+        return math.floor((shelf_length - current_used_len) / item_cost)
+
 def run_bulk_ffd_packing(sku_groups, shelf_length):
     if not sku_groups: return 0
     sorted_groups = sorted(sku_groups, key=lambda x: x[1], reverse=True); bins = []
@@ -415,24 +1257,8 @@ def run_bulk_ffd_packing(sku_groups, shelf_length):
                     if items_left_to_place == 0: break
     return len(bins)
 
-def calculate_fit_capacity(shelf_length, bin_state, item_width):
-    if item_width <= 0: return 0
-    count_on_shelf = bin_state['count']
-    if count_on_shelf == 0:
-        first_item_cost = item_width + 2 * SIDE_SPACING
-        if first_item_cost > shelf_length: return 0
-        item_cost = item_width + INTER_SPACING
-        return 1 + math.floor((shelf_length - first_item_cost) / item_cost) if item_cost > 0 else 1
-    else:
-        current_used_len = bin_state['sum_widths'] + (count_on_shelf - 1) * INTER_SPACING + 2 * SIDE_SPACING
-        item_cost = item_width + INTER_SPACING
-        if item_cost <= 0 or (shelf_length - current_used_len) < item_cost: return 0
-        return math.floor((shelf_length - current_used_len) / item_cost)
-
 def get_detailed_unplaced_reasons_by_sku_id(unplaced_skus, final_shelves, h_max, allow_rotation):
     reasons = {}
-    UNPLACED_REASON_COVERAGE = "托盘H不满足覆盖率要求"
-
     for _, sku in unplaced_skus.iterrows():
         sku_id = sku['sku_id']
         if sku['H'] > h_max:
@@ -450,79 +1276,68 @@ def get_detailed_unplaced_reasons_by_sku_id(unplaced_skus, final_shelves, h_max,
                 break
         
         if not can_fit_any_shelf:
-            representative_shelf = final_shelves[0] if final_shelves else {}
+            # 权重最高的货架，用于提供代表性的尺寸信息
+            representative_shelf = final_shelves[0]
             min_h_available = min(s['H'] for s in final_shelves) if final_shelves else 0
-            if representative_shelf and sku['W'] > representative_shelf.get('Wp', float('inf')):
-                reasons[sku_id] = f"超重: SKU重({sku['W']:.1f}kg) > 货架承重"
+            if sku['W'] > representative_shelf['Wp']:
+                reasons[sku_id] = f"超重: SKU重({sku['W']:.1f}kg) > 货架承重({representative_shelf['Wp']:.1f}kg)"
             elif sku['H'] > min_h_available:
                  reasons[sku_id] = f"过高: SKU高({sku['H']:.0f}) > 所有推荐货架的净高"
             else:
                 reasons[sku_id] = f"尺寸不匹配: L/D({sku['L']:.0f}x{sku['D']:.0f})与所有推荐货架尺寸均不符"
         else:
-              reasons[sku_id] = UNPLACED_REASON_COVERAGE
+              # SKU物理尺寸可以安放，但仍未被安放 - 可能是装箱装托类型不匹配
+              reasons[sku_id] = "货架类型不匹配: SKU的装箱装托要求与推荐货架类型不符，或算法优化过程中被其他SKU占用"
     return reasons
+
 
 def write_results_to_excel(original_file_path, placed_sku_ids, detailed_reasons, sku_id_col_name, sku_shelf_assignments=None, final_shelves=None):
     try:
-        original_df = pd.read_excel(original_file_path)
-        original_df[sku_id_col_name] = original_df[sku_id_col_name].astype(str)
-        
+        original_df = pd.read_excel(original_file_path); original_df[sku_id_col_name] = original_df[sku_id_col_name].astype(str)
         def get_status(sku_id): return "成功安放" if sku_id in placed_sku_ids else "未能安放"
-        def get_reason(sku_id): return detailed_reasons.get(str(sku_id), "") if str(sku_id) not in placed_sku_ids else ""
+        def get_reason(sku_id): return detailed_reasons.get(sku_id, "") if sku_id not in placed_sku_ids else ""
         def get_shelf_spec(sku_id):
-            if str(sku_id) in placed_sku_ids and sku_shelf_assignments and final_shelves:
-                shelf_idx = sku_shelf_assignments.get(str(sku_id))
-                if shelf_idx is not None:
-                    # Need to find the correct shelf spec in the potentially combined list
-                    # This part becomes tricky if indices are not global. Let's assume the solution provides correct final_shelves
-                    if shelf_idx < len(final_shelves):
-                         shelf = final_shelves[shelf_idx]
-                         return f"{shelf['Lp']:.0f}×{shelf['Dp']:.0f}×{shelf['H']:.0f}mm"
+            if sku_id in placed_sku_ids and sku_shelf_assignments and final_shelves:
+                shelf_idx = sku_shelf_assignments.get(sku_id)
+                if shelf_idx is not None and shelf_idx < len(final_shelves):
+                    shelf = final_shelves[shelf_idx]; return f"{shelf['Lp']:.0f}×{shelf['Dp']:.0f}×{shelf['H']:.0f}mm"
             return ""
-
         original_df['[安放状态]'] = original_df[sku_id_col_name].apply(get_status)
         original_df['[未安放原因]'] = original_df[sku_id_col_name].apply(get_reason)
         original_df['[货架规格]'] = original_df[sku_id_col_name].apply(get_shelf_spec)
-        
-        base, ext = os.path.splitext(original_file_path)
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        output_path = f"{base}_results_{timestamp}{ext}"
-        original_df.to_excel(output_path, index=False)
+        base, ext = os.path.splitext(original_file_path); timestamp = time.strftime("%Y%m%d_%H%M%S")
+        output_path = f"{base}_results_{timestamp}{ext}"; original_df.to_excel(output_path, index=False)
         return True, output_path, None
-    except Exception as e:
-        return False, None, str(e)
-
+    except Exception as e: return False, None, str(e)
 
 def calculate_ldh_utilization(final_solution, params):
     log_lines = ["\n" + "-" * 70 + "\n" + " " * 24 + ">>> 三维空间利用率分析 <<<\n" + "-" * 70]
-    assignments = final_solution.get('assignments', {})
-    final_shelves = final_solution.get('final_shelves', [])
-    counts = final_solution.get('counts', [])
-    
-    if not assignments or not final_shelves or not counts:
-        log_lines.append("无法计算利用率：缺少必要的方案数据。")
-        return "\n".join(log_lines)
-
+    assignments = final_solution.get('assignments', {}); final_shelves = final_solution.get('final_shelves', []); counts = final_solution.get('counts', [])
     for i, shelf_spec in enumerate(final_shelves):
         spec_line = f"\n对于规格 {i+1} ({shelf_spec['Lp']:.0f}L x {shelf_spec['Dp']:.0f}D x {shelf_spec['H']:.0f}H):"
-        log_lines.append(spec_line)
-        items_on_this_shelf = assignments.get(i, [])
-        shelf_count = counts[i]
-        
+        log_lines.append(spec_line); items_on_this_shelf = assignments.get(i, []); shelf_count = counts[i]
         if shelf_count == 0 or not items_on_this_shelf:
-            log_lines.append("  - 未分配SKU，利用率均为 0%")
-            continue
+            log_lines.append("  - 未分配SKU，利用率均为 0%"); continue
         
-        total_placed_width = sum(item[1] * item[2] for item in items_on_this_shelf)
-        total_item_count = sum(item[2] for item in items_on_this_shelf)
+        # vReX 1.0.1 修正: 直接处理精确的 (sku_dict, placed_width) 元组列表
+        total_placed_width = sum(item[1] for item in items_on_this_shelf)
+        total_item_count = len(items_on_this_shelf)
         
+        # 修正深度利用率计算：根据实际放置情况计算使用的深度
         total_depth_sum = 0
         for item in items_on_this_shelf:
-            sku_dict, placed_width, count = item
-            actual_depth = sku_dict['D'] if abs(placed_width - sku_dict['L']) < 1 else sku_dict['L']
-            total_depth_sum += actual_depth * count
+            sku_dict = item[0]
+            placed_width = item[1]
+            # 判断是否旋转：如果放置宽度等于SKU长度，则未旋转；否则已旋转
+            if abs(placed_width - sku_dict['L']) < 1:  # 允许1mm误差
+                # 未旋转，使用原始深度
+                actual_depth = sku_dict['D']
+            else:
+                # 已旋转，长度变成了深度
+                actual_depth = sku_dict['L']
+            total_depth_sum += actual_depth
         
-        total_sku_h_sum = sum(item[0]['H'] * item[2] for item in items_on_this_shelf)
+        total_sku_h_sum = sum(item[0]['H'] for item in items_on_this_shelf)
 
         total_available_length = (shelf_spec['Lp'] - 2 * SIDE_SPACING) * shelf_count
         l_util = total_placed_width / total_available_length if total_available_length > 0 else 0
@@ -532,91 +1347,205 @@ def calculate_ldh_utilization(final_solution, params):
         d_util = weighted_avg_depth / shelf_spec['Dp'] if shelf_spec['Dp'] > 0 else 0
         log_lines.append(f"  - D-利用率 (深度): {d_util:.2%}")
 
+        # 修正高度利用率计算：使用货架净高度而不是仓库总高度
         avg_sku_h = total_sku_h_sum / total_item_count if total_item_count > 0 else 0
         h_util = avg_sku_h / shelf_spec['H'] if shelf_spec['H'] > 0 else 0
         log_lines.append(f"  - H-利用率 (高度): {h_util:.2%}")
-        
-    log_lines.append("-" * 70)
-    return "\n".join(log_lines)
-    
-# #############################################################################
-# --- GUI与工作线程 ---
-# #############################################################################
+    log_lines.append("-" * 70); return "\n".join(log_lines)
 
-# MODIFICATION B: 改造B，彻底重构后台工作线程
-def calculation_worker(q, params, raw_data, shelves):
+def pre_calculation_worker(q, params):
     try:
-        # 1. 只保留一次主入口调用
-        calculation_results = main_calculation_with_grouping(
-            raw_data, shelves, params['coverage_target'], params['allow_rotation'],
-            params.get('pallet_char', 'A'), params.get('box_char', 'B'), params, q
+        q.put(("log", "--- 步骤 0: 正在读取与预处理文件 ---\n")); q.put(("progress_update", ("正在读取SKU数据...", 0.1)))
+        raw_data = read_excel_data(
+            params['excel_file'], 
+            params['sku_sheet'], 
+            params['cols'], 
+            params['can_box_col'],
+            params['can_pallet_col'],
+            params['box_count_col'],
+            params['pallet_count_col'],
+            params['boxes_per_pallet_col'],
+            params['pallet_preset'],
+            params['box_preset']
         )
+        q.put(("log", f"从'{params['sku_sheet']}'Sheet读取了 {len(raw_data)} 条有效的SKU数据。\n"))
         
-        # 2. 从结果中选择一个成功的方案进行展示
-        final_shelves, final_solution = None, None
+        q.put(("progress_update", ("正在读取货架数据...", 0.4)))
+        shelves = read_shelf_params(params['excel_file'], params['shelf_sheet'], params['shelf_type_col'], params['shelf_cols'])
+        q.put(("log", f"从'{params['shelf_sheet']}'Sheet读取了 {len(shelves)} 种货架规格。\n"))
         
-        # 优先选择 pallet_only, then mixed, then box_only
-        group_priority = ["pallet_only", "mixed", "box_only"]
+        q.put(("progress_update", ("正在进行数据相关性检验...", 0.7)))
         
-        for group_key in group_priority:
-            result = calculation_results['grouped_results'].get(group_key)
-            if result and result[0] == 'success':
-                q.put(("log", f"\n选择 '{group_key}' 组的成功方案进行展示。\n"))
-                final_shelves = result[2]['final_shelves']
-                final_solution = result[2]
-                break
+        # 在相关性分析前，需要先进行装箱装托判定并添加统一的L、D、H列
+        packing_summary = analyze_packing_decision(raw_data, params['pallet_decimal_threshold'], q)
+        raw_data_with_ldh = add_unified_ldh_columns(raw_data, packing_summary['decisions'])
+        
+        time.sleep(0.5); corr_label, corr_val, grade = correlation_analysis(raw_data_with_ldh)
+        q.put(("pre_calculation_done", (raw_data, raw_data_with_ldh, shelves, corr_label, corr_val, grade, packing_summary)))
+    except Exception as e: q.put(("error", f"在文件读取或预处理阶段发生错误：\n{str(e)}"))
 
-        if not final_solution:
-            # 找到覆盖率最高的失败尝试作为提示
-            best_failure_info = ""
-            max_cov = -1
-            for group, result in calculation_results['grouped_results'].items():
-                if result[0] == 'failure' and result[2]:
-                    cov = result[2].get('coverage_count', 0)
-                    if cov > max_cov:
-                        max_cov = cov
-                        best_failure_info = f"'{group}' 组最高达到 {cov*100:.1f}% 覆盖率。"
-            
-            raise ValueError(f"所有分组均未能找到成功的解决方案。{best_failure_info}")
+def calculation_worker(q, params, raw_data, shelves):
+    current_step = "初始化"
+    try:
+        # 调用重构后的主计算流程
+        q.put(("log", "\n--- 开始执行分组计算流程 ---\n"))
+        calculation_results = main_calculation_with_grouping(
+            raw_data,
+            shelves,
+            params['pallet_decimal_threshold'],
+            params['coverage_target'],
+            params['allow_rotation'],
+            params['pallet_char'],
+            params['box_char'],
+            params,
+            q
+        )
+        q.put(("log", "\n--- 分组计算流程完成 ---\n"))
 
-        # 3. 直接从新契约结构中获取所有需要的值
+        if "error" in calculation_results:
+            raise ValueError(calculation_results["error"])
+
+        # 整合结果并传递给GUI
+        # 这里需要根据main_calculation_with_grouping的返回结构来整合最终结果
+        # 假设main_calculation_with_grouping返回的final_result包含所有需要的信息
+        # 例如：{'packing_summary': ..., 'grouped_results': {'box_only': ..., 'pallet_only': ..., 'mixed': ...}}
+
+        # 示例：从grouped_results中提取第一个成功的解决方案作为最终方案进行展示
+        # 实际应用中可能需要更复杂的逻辑来选择“最优”方案或展示所有分组结果
+        final_solution = None
+        final_shelves = []
+        counts = []
+        unplaced_skus = pd.DataFrame()
+        detailed_reasons = {}
         packing_summary = calculation_results['packing_summary']
-        unplaced_skus_df = calculation_results['unplaced_skus']
-        detailed_reasons = calculation_results['detailed_reasons']
-        
-        # 4. 整理并发送最终结果给GUI
-        q.put(("result", (final_shelves, final_solution, params['coverage_target'], packing_summary)))
-        
-        utilization_log = calculate_ldh_utilization(final_solution, params)
-        q.put(("log", utilization_log))
-        
-        q.put(("diagnostics", (unplaced_skus_df, detailed_reasons)))
-        
-        # 为图表准备数据
-        operable_data = raw_data[~raw_data['sku_id'].isin(packing_summary['error_skus'])]
-        q.put(("visualization_data", (operable_data, [], final_solution))) # eval_details is not available in this flow yet
 
-        # 5. 导出Excel
+        # 遍历所有分组结果，尝试找到一个成功的方案进行展示
+        for group_name, result in calculation_results['grouped_results'].items():
+            if result[0] == "success":
+                # result[1] 是 (shelf1, shelf2) 元组
+                # result[2] 是 evaluate_shelf_combination 返回的 solution 字典
+                final_shelves = [result[1][0], result[1][1]]
+                final_solution = result[2]
+                # 这里需要从solution中提取counts, unplaced_skus, detailed_reasons
+                # 由于evaluate_shelf_combination的返回结构不包含unplaced_skus和detailed_reasons
+                # 需要调整或在main_calculation_with_grouping中收集这些信息
+                # 暂时使用placeholder
+                counts = final_solution['counts']
+                break # 找到第一个成功的就退出
+
+        if final_solution is None:
+            raise ValueError("未能找到任何成功的货架优化方案。")
+
+        # 从main_calculation_with_grouping的结果中获取unplaced_skus和detailed_reasons
+        unplaced_skus = calculation_results.get('unplaced_skus', pd.DataFrame())
+        detailed_reasons = calculation_results.get('detailed_reasons', {})
+
+        # 传递结果给GUI
+        q.put(("update_status", "计算完成"))
+        q.put(("update_progress", 100))
+        q.put(("calculation_done", (
+            final_shelves,
+            final_solution,
+            params['coverage_target'],
+            unplaced_skus,
+            detailed_reasons,
+            packing_summary
+        )))
+            
+        if params['ld_method'] == 'complementary':
+                status, ld_return_value = ld_calculator_complementary(agg_data['box'], box_shelves, params['coverage_target'], params['allow_rotation'], q, params)
+        else:
+                status, ld_return_value = ld_calculator_single(agg_data['box'], box_shelves, params['coverage_target'], params['allow_rotation'], q)
+            
+        if status == "success":
+                best_ld_results['box'] = ld_return_value
+                q.put(("log", f"装箱货架最优L&D规格计算完成\n"))
+        else:
+                q.put(("log", f"警告: 装箱货架L&D计算失败\n"))
+        
+        if not best_ld_results:
+            q.put(("error", "L&D计算失败：无法为任何货架类型找到满足要求的规格。"))
+            return
+        
+        best_ld_for_h_calc = best_ld_results
+
+        q.put(("log", f"--- {current_step} 完成 ---\n")); current_step = f"步骤4: 计算最优H规格 (使用 {params['h_method']} 算法)"; q.put(("log", f"\n--- {current_step} 开始 ---\n"))
+        h_calculators = {'manual': h_calculator_coverage_driven, 'three_dimensional': h_calculator_three_dimensional, 'boundary': h_calculator_boundary_driven}
+        h_method = params['h_method']; h_cand, eval_details = [], []
+
+        if h_method == 'manual':
+            h_cand, eval_details = h_calculators[h_method](operable_data, h_max, params['p1'], params['p2'])
+        else:
+            # 使用装托数据进行高度计算（优先），如果没有则使用装箱数据
+            primary_ld_result = best_ld_for_h_calc.get('pallet', best_ld_for_h_calc.get('box'))
+            primary_agg_data = agg_data.get('pallet', agg_data.get('box'))
+            h_cand, eval_details = h_calculators[h_method](primary_agg_data, operable_data, primary_ld_result, params['coverage_target'], params['allow_rotation'], params, q)
+
+       # --- 步骤 5: 组合装托和装箱货架规格，执行精确装箱 ---
+        current_step = "步骤5: 最终规格确定与精确装箱"; q.put(("log", f"\n--- {current_step} 开始 ---\n"))
+        optimal_shelves = []
+
+        # 组合装托和装箱货架的最优规格
+        for shelf_type, ld_result in best_ld_results.items():
+            if len(h_cand) >= 2:
+                h1, h2 = h_cand[0], h_cand[1]
+                
+                if params['ld_method'] == 'complementary':
+                    ld1, ld2 = ld_result[0], ld_result[1]
+                    shelf_type_char = params['pallet_char'] if shelf_type == 'pallet' else params['box_char']
+                    optimal_shelves.extend([
+                        {'Lp': ld1['Lp'], 'Dp': ld1['Dp'], 'Wp': ld1['Wp'], 'H': h1, 'shelf_type': shelf_type_char, 'data_type': shelf_type},
+                        {'Lp': ld1['Lp'], 'Dp': ld1['Dp'], 'Wp': ld1['Wp'], 'H': h2, 'shelf_type': shelf_type_char, 'data_type': shelf_type},
+                        {'Lp': ld2['Lp'], 'Dp': ld2['Dp'], 'Wp': ld2['Wp'], 'H': h1, 'shelf_type': shelf_type_char, 'data_type': shelf_type},
+                        {'Lp': ld2['Lp'], 'Dp': ld2['Dp'], 'Wp': ld2['Wp'], 'H': h2, 'shelf_type': shelf_type_char, 'data_type': shelf_type},
+                    ])
+                else:
+                    ld = ld_result[0] if isinstance(ld_result, tuple) else ld_result
+                    shelf_type_char = params['pallet_char'] if shelf_type == 'pallet' else params['box_char']
+                    optimal_shelves.extend([
+                        {'Lp': ld['Lp'], 'Dp': ld['Dp'], 'Wp': ld['Wp'], 'H': h1, 'shelf_type': shelf_type_char, 'data_type': shelf_type},
+                        {'Lp': ld['Lp'], 'Dp': ld['Dp'], 'Wp': ld['Wp'], 'H': h2, 'shelf_type': shelf_type_char, 'data_type': shelf_type}
+                    ])
+
+        if not optimal_shelves:
+            raise ValueError("未能确定最终的货架规格，计算中止。")
+        
+        q.put(("log", f"最优货架规格已确定（共{len(optimal_shelves)}种），开始执行精确装箱...\n"))
+        
+        # 添加覆盖率预估验证
+        q.put(("log", "正在进行精确装箱前的覆盖率预估...\n"))
+        pre_estimate = final_placement_with_individual_skus_mixed(operable_data, optimal_shelves, packing_summary['decisions'], params['allow_rotation'], q)
+        actual_coverage_count = len(pre_estimate['placed_sku_ids']) / len(operable_data) if len(operable_data) > 0 else 0
+        q.put(("log", f"预估结果：实际SKU覆盖率约为 {actual_coverage_count*100:.1f}%\n"))
+        
+        if actual_coverage_count < params['coverage_target'] * 0.8:  # 如果实际覆盖率低于目标的80%
+            q.put(("log", f"警告：实际覆盖率({actual_coverage_count*100:.1f}%)显著低于目标({params['coverage_target']*100:.1f}%)，可能需要调整参数或检查数据匹配性。\n"))
+        
+        final_solution = pre_estimate  # 直接使用预估结果，避免重复计算
+        q.put(("log", "精确装箱计算完成。\n"))
+
+        if not final_solution['placed_sku_ids']:
+              raise ValueError("计算失败：即使在最优货架标准下，也未能安放任何SKU。")
+
+        # --- 步骤 6: 结果整理与输出 ---
+        current_step = "步骤6: 结果整理"; q.put(("log", f"\n--- {current_step} 开始 ---\n"))
+        q.put(("result", (optimal_shelves, final_solution, params['coverage_target'], packing_summary)))
+        utilization_log = calculate_ldh_utilization(final_solution, params); q.put(("log", utilization_log))
+        
+        placed_sku_ids = final_solution['placed_sku_ids']; unplaced_skus_df = operable_data[~operable_data['sku_id'].isin(placed_sku_ids)]
+        detailed_reasons = get_detailed_unplaced_reasons_by_sku_id(unplaced_skus_df, optimal_shelves, h_max, params['allow_rotation'])
+        q.put(("diagnostics", (unplaced_skus_df, detailed_reasons)));
+        q.put(("visualization_data", (operable_data, eval_details, final_solution)))
+
         if params['excel_file']:
-            success, path, error_msg = write_results_to_excel(
-                params['excel_file'], 
-                final_solution['placed_sku_ids'], 
-                detailed_reasons, 
-                params['cols']['sku_id'], 
-                final_solution.get('sku_shelf_assignments'), 
-                final_shelves
-            )
-            if success:
-                q.put(("log", f"\n结果已成功写入到新文件:\n{path}\n"))
-            else:
-                q.put(("log", f"\n!!!!!! 写入Excel文件失败 !!!!!!\n错误: {error_msg}\n"))
+            success, path, error_msg = write_results_to_excel(params['excel_file'], placed_sku_ids, detailed_reasons, params['cols']['sku_id'], final_solution.get('sku_shelf_assignments'), optimal_shelves)
+            if success: q.put(("log", f"\n结果已成功写入到新文件:\n{path}\n"))
+            else: q.put(("log", f"\n!!!!!! 写入Excel文件失败 !!!!!!\n错误: {error_msg}\n"))
 
         q.put(("done", "计算完成！"))
-
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        q.put(("error", f"计算过程中发生错误: {str(e)}"))
+        q.put(("error", f"在 [{current_step}] 阶段发生了一个意外错误。\n请检查您的输入数据和参数配置是否正确。\n\n技术细节: {str(e)}"))
+
 
 # #############################################################################
 # --- 图形用户界面 (GUI) ---
