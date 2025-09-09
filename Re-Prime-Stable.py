@@ -483,7 +483,7 @@ def split_shelves_by_type(shelves, pallet_char, box_char, q):
     return grouped_shelves
 
 
-def process_grouped_calculations(grouped_data, grouped_shelves, coverage_target, allow_rotation, params, q):
+def process_grouped_calculations(grouped_data, grouped_shelves, coverage_target, allow_rotation, params, q, packing_decisions):
     """
     分组独立运行L&D互补算法
     
@@ -494,6 +494,7 @@ def process_grouped_calculations(grouped_data, grouped_shelves, coverage_target,
         allow_rotation: 是否允许旋转
         params: 其他参数
         q: 日志队列
+        packing_decisions: 装箱装托决策信息
     
     Returns:
         dict: 各组的计算结果
@@ -507,7 +508,7 @@ def process_grouped_calculations(grouped_data, grouped_shelves, coverage_target,
         q.put(("log", "开始处理纯装箱组...\n"))
         # 注意：这里需要调用聚合函数将SKU数据转换为计算所需的格式
         # 后续代码需要修改：需要添加数据聚合步骤
-        agg_box_data = aggregate_sku_data(grouped_data['box_only_data'])  # 需要实现此函数
+        agg_box_data = aggregate_sku_data(grouped_data['box_only_data'], packing_decisions)  # 传入决策信息
         box_result = ld_calculator_complementary(
             agg_box_data, 
             grouped_shelves['box_shelves'], 
@@ -525,7 +526,7 @@ def process_grouped_calculations(grouped_data, grouped_shelves, coverage_target,
     # 处理纯装托组
     if not grouped_data['pallet_only_data'].empty and grouped_shelves['pallet_shelves']:
         q.put(("log", "开始处理纯装托组...\n"))
-        agg_pallet_data = aggregate_sku_data(grouped_data['pallet_only_data'])  # 需要实现此函数
+        agg_pallet_data = aggregate_sku_data(grouped_data['pallet_only_data'], packing_decisions)  # 传入决策信息
         pallet_result = ld_calculator_complementary(
             agg_pallet_data, 
             grouped_shelves['pallet_shelves'], 
@@ -545,7 +546,7 @@ def process_grouped_calculations(grouped_data, grouped_shelves, coverage_target,
         q.put(("log", "开始处理混装组...\n"))
         # 策略1：优先使用装托货架（因为混装组使用的是装托数据）
         if grouped_shelves['pallet_shelves']:
-            agg_mixed_data = aggregate_sku_data(grouped_data['mixed_data'])  # 需要实现此函数
+            agg_mixed_data = aggregate_sku_data(grouped_data['mixed_data'], packing_decisions)  # 传入决策信息
             mixed_result = ld_calculator_complementary(
                 agg_mixed_data, 
                 grouped_shelves['pallet_shelves'], 
@@ -567,7 +568,7 @@ def process_grouped_calculations(grouped_data, grouped_shelves, coverage_target,
             mixed_data_for_box['W'] = mixed_data_for_box['box_w']
             mixed_data_for_box['V'] = mixed_data_for_box['box_v']
             
-            agg_mixed_data = aggregate_sku_data(mixed_data_for_box)
+            agg_mixed_data = aggregate_sku_data(mixed_data_for_box, packing_decisions)
             mixed_result = ld_calculator_complementary(
                 agg_mixed_data, 
                 grouped_shelves['box_shelves'], 
@@ -588,27 +589,54 @@ def process_grouped_calculations(grouped_data, grouped_shelves, coverage_target,
     return results
 
 
-def aggregate_sku_data(data):
+def aggregate_sku_data(data, packing_decisions=None):
     """
     将SKU数据聚合为计算所需的格式
-    按照L、D、H、W、V的组合进行分组，计算每组的数量
+    按照L、D、H、W、V的组合进行分组，计算每组的实际业务数量
     
     Args:
         data: 包含L、D、H、W、V列的SKU数据
+        packing_decisions: 装箱装托判定结果字典
     
     Returns:
-        DataFrame: 聚合后的数据，包含count和sku_ids列
+        DataFrame: 聚合后的数据，包含实际业务数量count和sku_ids列
     """
     if data.empty:
         return pd.DataFrame()
     
+    # 为数据添加实际业务数量
+    data_with_actual_count = data.copy()
+    actual_counts = []
+    
+    for _, sku in data_with_actual_count.iterrows():
+        sku_id = sku['sku_id']
+        actual_count = 1  # 默认值
+        
+        if packing_decisions and sku_id in packing_decisions:
+            decision_info = packing_decisions[sku_id]
+            decision = decision_info['decision']
+            
+            # 根据决策类型计算实际业务数量
+            if decision == 'box_only':
+                actual_count = decision_info['final_box_count']
+            elif decision == 'pallet_only':
+                actual_count = decision_info['final_pallet_count']
+            elif decision == 'mixed':
+                # 混装：装托数 + 剩余装箱数
+                actual_count = decision_info['final_pallet_count'] + decision_info['remaining_box_count']
+        
+        actual_counts.append(max(1, actual_count))  # 确保至少为1
+    
+    data_with_actual_count['actual_count'] = actual_counts
+    
     # 按照LDHWV的组合进行分组聚合
-    agg_data = data.groupby(['L', 'D', 'H', 'W', 'V']).agg({
-        'sku_id': ['count', lambda x: list(x)]
+    agg_data = data_with_actual_count.groupby(['L', 'D', 'H', 'W', 'V']).agg({
+        'sku_id': ['count', lambda x: list(x)],
+        'actual_count': 'sum'  # 汇总实际业务数量
     }).reset_index()
     
     # 平整化列名
-    agg_data.columns = ['L', 'D', 'H', 'W', 'V', 'count', 'sku_ids']
+    agg_data.columns = ['L', 'D', 'H', 'W', 'V', 'sku_count', 'sku_ids', 'count']
     
     return agg_data
 
@@ -654,7 +682,8 @@ def add_unified_ldh_columns(data, packing_decisions):
                 w_values.append(sku['pallet_w'])
                 v_values.append(sku['pallet_v'])
             elif decision == 'mixed':
-                # 混装情况，优先使用装托数据（因为通常体积更大）
+                # 混装情况，为了简化，使用装托数据作为主要计算基础
+                # 但在聚合时会通过实际业务数量正确计算覆盖率
                 l_values.append(sku['pallet_l'])
                 d_values.append(sku['pallet_d'])
                 h_values.append(sku['pallet_h'])
@@ -768,7 +797,7 @@ def main_calculation_with_grouping(data, shelves, pallet_decimal_threshold, cove
     
     # 步骤4：分组独立计算
     calculation_results = process_grouped_calculations(
-        grouped_data, grouped_shelves, coverage_target, allow_rotation, params, q
+        grouped_data, grouped_shelves, coverage_target, allow_rotation, params, q, packing_summary['decisions']
     )
     
     # 整合最终结果
@@ -1004,10 +1033,9 @@ def ld_calculator_complementary(agg_data, shelves, coverage_target, allow_rotati
                 new_skus = set(sku_ids) - all_fittable_sku_ids
                 if new_skus:
                     all_fittable_sku_ids.update(new_skus)
-                    # 只计算新增的SKU
-                    new_count = len(new_skus)
-                    combined_count += new_count
-                    combined_volume += item['V'] * new_count
+                    # 使用原始的count值，而不是new_skus的数量
+                    combined_count += count
+                    combined_volume += item['V'] * count
         
         current_coverage = combined_count / total_sku_count if total_sku_count > 0 else 0
         
@@ -1259,26 +1287,36 @@ def final_placement_with_individual_skus_mixed(operable_data, final_shelves, pac
         possible_fits = []
 
         for i, shelf in enumerate(final_shelves):
-            shelf_data_type = shelf.get('data_type', 'pallet')  # 默认使用装托数据
+            # 简化逻辑：根据货架标识字符判断类型
+            shelf_type = shelf.get('类型', '')  # 获取货架类型标识
             
             # 根据装箱装托决策和货架类型选择适当的LDHWV数据
             use_this_shelf = False
-            if decision == 'box_only' and shelf_data_type == 'box':
+            use_box_data = False
+            
+            if decision == 'box_only':
+                # 装箱SKU优先使用B类货架，但也可以使用A类货架
                 use_this_shelf = True
-            elif decision == 'pallet_only' and shelf_data_type == 'pallet':
+                use_box_data = True
+            elif decision == 'pallet_only':
+                # 装托SKU只能使用A类货架
                 use_this_shelf = True
+                use_box_data = False
             elif decision == 'mixed':
-                # 混装SKU可以使用任何类型的货架
+                # 混装SKU可以使用任何类型的货架，优先使用装托数据
                 use_this_shelf = True
+                use_box_data = False
             
             if not use_this_shelf:
                 continue
             
-            # 根据货架数据类型选择对应的SKU尺寸数据
-            if shelf_data_type == 'pallet':
-                sku_l, sku_d, sku_h, sku_w, sku_v = sku['pallet_l'], sku['pallet_d'], sku['pallet_h'], sku['pallet_w'], sku['pallet_v']
-            else:
+            # 根据决策选择对应的SKU尺寸数据
+            if use_box_data:
                 sku_l, sku_d, sku_h, sku_w, sku_v = sku['box_l'], sku['box_d'], sku['box_h'], sku['box_w'], sku['box_v']
+                data_type_used = 'box'
+            else:
+                sku_l, sku_d, sku_h, sku_w, sku_v = sku['pallet_l'], sku['pallet_d'], sku['pallet_h'], sku['pallet_w'], sku['pallet_v']
+                data_type_used = 'pallet'
             
             if sku_w > shelf['Wp'] or sku_h > shelf['H']:
                 continue
@@ -1293,7 +1331,7 @@ def final_placement_with_individual_skus_mixed(operable_data, final_shelves, pac
                     vol_util = 0
                     if shelf['Lp'] > 0 and shelf['Dp'] > 0 and shelf['H'] > 0:
                         vol_util = (w * d * sku_h) / (shelf['Lp'] * shelf['Dp'] * shelf['H'])
-                    possible_fits.append({'shelf_idx': i, 'width': w, 'vol_util': vol_util, 'data_type': shelf_data_type})
+                    possible_fits.append({'shelf_idx': i, 'width': w, 'vol_util': vol_util, 'data_type': data_type_used})
         
         if possible_fits:
             best_fit = max(possible_fits, key=lambda x: x['vol_util'])
@@ -1690,7 +1728,7 @@ def calculation_worker(q, params, raw_data, shelves, agg_data=None):
         # 聚合数据
         if agg_data is None:
             q.put(("log", "缓存未命中，正在进行SKU数据聚合...\n"))
-            agg_data = aggregate_sku_data(operable_data)
+            agg_data = aggregate_sku_data(operable_data, packing_summary['decisions'])
             q.put(("log", f"数据聚合完成，规格组数量: {len(agg_data)}\n"))
             q.put(("agg_data_computed", (agg_data, operable_data)))
         else:
