@@ -23,7 +23,7 @@
     "w": 50.0,
     "v": 0.05
   },
-  "coverage_target": 0.95,
+  "coverage_target": 0.92,
   "h_max": 2300.0,
   "warehouse_h": 6000.0,
   "bottom_clearance": 150.0,
