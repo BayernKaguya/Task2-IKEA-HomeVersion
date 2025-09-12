@@ -1,0 +1,62 @@
+{
+  "sku_sheet": "Inventory",
+  "shelf_sheet": "LocationMaster",
+  "can_box_col": "Storage by Carton",
+  "can_pallet_col": "Storage by Pallet",
+  "box_count_col": "Convert to Carton",
+  "pallet_count_col": "Convert to Pallet",
+  "boxes_per_pallet_col": "Outer Carton per Pallet",
+  "shelf_type_col": "Storage Method",
+  "pallet_char": "Pallet",
+  "box_char": "Carton",
+  "pallet_preset": {
+    "l": 1200.0,
+    "d": 1000.0,
+    "h": 800.0,
+    "w": 500.0,
+    "v": 2.0
+  },
+  "box_preset": {
+    "l": 400.0,
+    "d": 350.0,
+    "h": 300.0,
+    "w": 50.0,
+    "v": 0.05
+  },
+  "coverage_target": 0.9,
+  "h_max": 2300.0,
+  "warehouse_h": 6000.0,
+  "bottom_clearance": 150.0,
+  "layer_headroom": 100.0,
+  "shelf_thickness": 50.0,
+  "area_threshold": 0.7,
+  "size_threshold": 0.8,
+  "pallet_decimal_threshold": 0.3,
+  "allow_rotation": true,
+  "ld_method": "complementary",
+  "h_method": "three_dimensional",
+  "cols": {
+    "sku_id": "SKU",
+    "pallet_l": "Pallet Length(mm)",
+    "pallet_d": "Pallet Width(mm)",
+    "pallet_h": "Pallet Height(mm)",
+    "pallet_w": "Pallet Weight(kg)",
+    "pallet_v": "Pallet Volume(cbm)",
+    "box_l": "Outer Carton Length(mm)",
+    "box_d": "Outer Carton Width(mm)",
+    "box_h": "Outer Carton Height(mm)",
+    "box_w": "Outer Carton Weight(kg)",
+    "box_v": "Outer Carton Volume(cbm)"
+  },
+  "shelf_cols": {
+    "lp": "Location Width(mm)",
+    "dp": "Location Depth(mm)",
+    "wp": "Location Height Limit(mm)"
+  },
+  "height_step": 5.0,
+  "min_height_diff": 150.0,
+  "count_weight": 0.25,
+  "volume_weight": 0.25,
+  "height_weight": 0.5,
+  "min_count_utilization": 0.9
+}

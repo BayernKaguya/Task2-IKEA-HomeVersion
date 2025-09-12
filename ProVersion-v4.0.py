@@ -1,5 +1,5 @@
 # shelf_optimizer_gui_final.py
-# 版本号：v3.6.5 beta
+# 版本号：v4.0.0
 
 import customtkinter as ctk
 import tkinter.filedialog as filedialog
@@ -710,7 +710,7 @@ def calculation_worker(q, params, raw_data, shelves, agg_data=None):
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("货架配置优化工具 ProVersion-3.6.5 beta")
+        self.title("货架配置优化工具 ProVersion-4.0.0")
         self.geometry("1280x850")
         self.grid_columnconfigure(1, weight=1); self.grid_rowconfigure(0, weight=1)
         
@@ -800,9 +800,9 @@ class App(ctk.CTk):
         self.display_welcome_message(); self.toggle_ld_params(); self.toggle_h_params(); self.after(100, self.process_queue)
 
     def display_welcome_message(self):
-        self.update_textbox("""欢迎使用货架配置优化工具 ProVersion-3.6.5 beta！
+        self.update_textbox("""欢迎使用货架配置优化工具 ProVersion-4.0.0！
 
-v3.6.5 beta 更新:
+v4.0.0 更新:
 - 可视化升级: 引入全新的四图表“分析仪表盘”，更直观地展示优化方案、决策依据、成果分析和真实装箱效果。
 - 兼容性修复: 解决了新版精确装箱逻辑与旧版图表函数的数据结构冲突问题。
 
